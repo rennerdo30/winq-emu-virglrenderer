@@ -35,6 +35,9 @@ struct vkr_physical_device {
     */
    bool use_host_memory_import;
    VkDeviceSize min_imported_host_pointer_alignment;
+   bool host_external_memory_win32;
+   bool host_external_fence_win32;
+   bool host_external_semaphore_win32;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    bool mem_type_spoof;

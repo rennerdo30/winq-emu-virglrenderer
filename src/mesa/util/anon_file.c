@@ -29,6 +29,14 @@
 
 #include "anon_file.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#else
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -44,7 +52,9 @@
 #else
 #include <stdio.h>
 #endif
+#endif /* _WIN32 */
 
+#ifndef _WIN32
 #if !(defined(__FreeBSD__) || defined(HAVE_MEMFD_CREATE) ||                    \
       defined(HAVE_MKOSTEMP) || defined(__ANDROID__) || defined(__APPLE__))
 static int
@@ -114,6 +124,56 @@ create_tmpfile_cloexec(char *tmpname)
  * transmitting the file descriptor over Unix sockets using the
  * SCM_RIGHTS methods.
  */
+#endif /* !_WIN32 - close guard around helper functions */
+
+#ifdef _WIN32
+int
+os_create_anonymous_file(off_t size, const char *debug_name)
+{
+   char temp_path[MAX_PATH];
+   char temp_file[MAX_PATH];
+
+   DWORD path_len = GetTempPathA(MAX_PATH, temp_path);
+   if (!path_len || path_len >= MAX_PATH)
+      return -1;
+
+   UINT name_ret = GetTempFileNameA(temp_path,
+                                    (debug_name && debug_name[0]) ? debug_name : "vrg",
+                                    0, temp_file);
+   if (!name_ret)
+      return -1;
+
+   HANDLE file = CreateFileA(temp_file,
+                             GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL,
+                             CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                             NULL);
+   if (file == INVALID_HANDLE_VALUE) {
+      DeleteFileA(temp_file);
+      return -1;
+   }
+
+   LARGE_INTEGER file_size;
+   file_size.QuadPart = size;
+   if (!SetFilePointerEx(file, file_size, NULL, FILE_BEGIN) ||
+       !SetEndOfFile(file)) {
+      CloseHandle(file);
+      DeleteFileA(temp_file);
+      return -1;
+   }
+
+   int fd = _open_osfhandle((intptr_t)file, _O_BINARY);
+   if (fd < 0) {
+      CloseHandle(file);
+      DeleteFileA(temp_file);
+      return -1;
+   }
+
+   return fd;
+}
+#else /* !_WIN32 */
 int
 os_create_anonymous_file(off_t size, const char *debug_name)
 {
@@ -183,3 +243,4 @@ os_create_anonymous_file(off_t size, const char *debug_name)
 
    return fd;
 }
+#endif /* !_WIN32 */

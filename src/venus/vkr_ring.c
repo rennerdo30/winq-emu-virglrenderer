@@ -6,12 +6,15 @@
 #include "vkr_ring.h"
 
 #include <stdio.h>
-#ifdef __APPLE__
+
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
 #include <pthread/qos.h>
 #else
 #include <sys/resource.h>
 #endif
-#include <time.h>
 
 #include "vn_protocol_renderer_dispatches.h"
 
@@ -259,7 +262,17 @@ vkr_ring_thread(void *arg)
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
    if (ring->prio_valid) {
-#ifdef __APPLE__
+#ifdef _WIN32
+      if (!SetThreadPriority(GetCurrentThread(),
+                             ring->prio <= -10 ? THREAD_PRIORITY_HIGHEST :
+                             ring->prio <= 0   ? THREAD_PRIORITY_ABOVE_NORMAL :
+                                                 THREAD_PRIORITY_NORMAL)) {
+#ifdef DEBUG
+         vkr_log("failed to set ring thread priority to %d (%lu)", ring->prio,
+                 GetLastError());
+#endif
+      }
+#elif defined(__APPLE__)
       /* On macOS setpriority(PRIO_PROCESS, 0, prio) renices the whole process, not
        * the calling thread, and an unprivileged process can never lower its nice
        * value again. Lower only this thread's QoS class for a positive guest nice
@@ -381,7 +394,11 @@ bool
 vkr_ring_stop(struct vkr_ring *ring)
 {
    mtx_lock(&ring->mutex);
+#ifdef _WIN32
+   if (GetThreadId(ring->thread) == GetCurrentThreadId()) {
+#else
    if (thrd_equal(ring->thread, thrd_current())) {
+#endif
       mtx_unlock(&ring->mutex);
       return false;
    }

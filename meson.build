@@ -424,7 +424,10 @@ if with_venus
       conf_data.set('ENABLE_VULKAN_PRELOAD', 1)
    endif
 
-   if with_render_server_worker == 'process'
+   if with_host_windows
+      # Windows always uses thread workers (in-process render server)
+      conf_data.set('ENABLE_RENDER_SERVER_WORKER_THREAD', 1)
+   elif with_render_server_worker == 'process'
       conf_data.set('ENABLE_RENDER_SERVER_WORKER_PROCESS', 1)
    elif with_render_server_worker == 'thread'
       if not has_attribute_cleanup
@@ -493,7 +496,9 @@ if with_vrend and not with_host_windows
    subdir('vtest')
 endif
 
-if with_render_server == 'process'
+# Windows runs its own in-process render server (src/proxy/proxy_server.c),
+# never the separate server executable.
+if with_render_server == 'process' and not with_host_windows
 subdir('server')
 endif
 

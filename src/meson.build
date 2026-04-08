@@ -93,6 +93,7 @@ venus_sources = [
    'venus/vkr_renderer.c',
    'venus/vkr_ring.c',
    'venus/vkr_transport.c',
+   'venus/vkr_win32_shim.c',
 ]
 
 venus_codegen = custom_target(
@@ -268,6 +269,7 @@ endif
 
 if with_host_windows
   virgl_sources += ['mman_win32.c']
+  virgl_depends += [meson.get_compiler('c').find_library('ws2_32')]
 endif
 
 libvirgl = static_library(

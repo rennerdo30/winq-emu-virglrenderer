@@ -5,7 +5,11 @@
 
 #include "vkr_common.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include "vkr_library.h"
 
@@ -42,6 +46,20 @@ vkr_library_load(struct vulkan_library *lib)
    if (lib->handle)
       return true;
 
+#ifdef _WIN32
+   lib->handle = LoadLibraryA("vulkan-1.dll");
+   if (lib->handle == NULL) {
+      vkr_log("failed to open vulkan-1.dll: error %lu", GetLastError());
+      return false;
+   }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+   lib->GetInstanceProcAddr =
+      (PFN_vkGetInstanceProcAddr)GetProcAddress(lib->handle, "vkGetInstanceProcAddr");
+#pragma GCC diagnostic pop
+
+#else /* !_WIN32 */
 #ifdef __APPLE__
    lib->handle = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
    if (lib->handle == NULL)
@@ -63,7 +81,6 @@ vkr_library_load(struct vulkan_library *lib)
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
-   /* ISO C forbids conversion of object pointer to function pointer type */
    lib->GetInstanceProcAddr =
       (PFN_vkGetInstanceProcAddr)dlsym(lib->handle, "vkGetInstanceProcAddr");
 #pragma GCC diagnostic pop
@@ -73,16 +90,21 @@ vkr_library_load(struct vulkan_library *lib)
       vkr_log("dlerror: %s", error);
       goto fail;
    }
+#endif /* _WIN32 */
 
    if (lib->GetInstanceProcAddr == NULL) {
-      vkr_log("failed to load vkGetInstanceProcAddr: %s", dlerror());
+      vkr_log("failed to load vkGetInstanceProcAddr");
       goto fail;
    }
 
    return true;
 
 fail:
+#ifdef _WIN32
+   FreeLibrary(lib->handle);
+#else
    dlclose(lib->handle);
+#endif
    lib->handle = NULL;
    return false;
 }
@@ -91,7 +113,11 @@ void
 vkr_library_unload(struct vulkan_library *lib)
 {
    if (lib->handle) {
+#ifdef _WIN32
+      FreeLibrary(lib->handle);
+#else
       dlclose(lib->handle);
+#endif
       lib->GetInstanceProcAddr = NULL;
       lib->handle = NULL;
    }
