@@ -118,8 +118,11 @@ send_all(SOCKET s, const void *data, size_t len)
    const char *p = data;
    while (len > 0) {
       int sent = send(s, p, (int)len, 0);
-      if (sent <= 0)
+      if (sent <= 0) {
+         fprintf(stderr, "proxy client: send(socket %llu, %zu bytes) = %d, WSA error %d\n",
+                 (unsigned long long)s, len, sent, sent < 0 ? WSAGetLastError() : 0);
          return false;
+      }
       p += sent;
       len -= sent;
    }
@@ -132,8 +135,11 @@ recv_all(SOCKET s, void *data, size_t len)
    char *p = data;
    while (len > 0) {
       int got = recv(s, p, (int)len, 0);
-      if (got <= 0)
+      if (got <= 0) {
+         fprintf(stderr, "proxy client: recv(socket %llu, %zu bytes) = %d, WSA error %d\n",
+                 (unsigned long long)s, len, got, got < 0 ? WSAGetLastError() : 0);
          return false;
+      }
       p += got;
       len -= got;
    }

@@ -17,6 +17,8 @@
 #endif
 
 #include "server/render_protocol.h"
+#include <stddef.h>
+#include <inttypes.h>
 
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
 #include "server/render_context.h"
@@ -120,8 +122,11 @@ server_recv_all(int fd, void *data, size_t len)
    char *p = data;
    while (len > 0) {
       int got = recv((SOCKET)fd, p, (int)len, 0);
-      if (got <= 0)
+      if (got <= 0) {
+         fprintf(stderr, "proxy server: recv(socket %d, %zu bytes) = %d, WSA error %d\n",
+                 fd, len, got, got < 0 ? WSAGetLastError() : 0);
          return false;
+      }
       p += got;
       len -= got;
    }
@@ -134,8 +139,11 @@ server_send_all(int fd, const void *data, size_t len)
    const char *p = data;
    while (len > 0) {
       int sent = send((SOCKET)fd, p, (int)len, 0);
-      if (sent <= 0)
+      if (sent <= 0) {
+         fprintf(stderr, "proxy server: send(socket %d, %zu bytes) = %d, WSA error %d\n",
+                 fd, len, sent, sent < 0 ? WSAGetLastError() : 0);
          return false;
+      }
       p += sent;
       len -= sent;
    }
@@ -426,8 +434,15 @@ server_context_worker_thread(void *arg)
          mtx_unlock(&state->renderer_mutex);
 
          if (!ok || res_fd < 0) {
+            /* The client always reads the fd count after the reply
+             * (proxy_socket_receive_reply_with_fds); without it QEMU's main
+             * loop blocks in recv() forever, holding the BQL.
+             */
+            proxy_log("server worker: create resource %u (blob %" PRIu64
+                      ", size %" PRIu64 ", flags 0x%x) failed: ok=%d fd=%d",
+                      res_id, blob_id, blob_size, blob_flags, ok, res_fd);
             reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
-            server_send_reply(w->socket_fd, &reply, sizeof(reply));
+            server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply), NULL, 0);
          } else {
             server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply),
                                        &res_fd, 1);
@@ -436,15 +451,20 @@ server_context_worker_thread(void *arg)
       }
 
       case RENDER_CONTEXT_OP_IMPORT_RESOURCE: {
-         struct {
-            uint32_t res_id;
-            enum virgl_resource_fd_type fd_type;
-            uint64_t size;
-         } imp_body;
+         /* The client sends the whole protocol struct, including the
+          * 4 padding bytes before the 64-bit size. Reading a repacked
+          * struct (16 instead of 20 body bytes) left 4 bytes in the stream,
+          * every later message was read shifted, and QEMU's main loop hung
+          * in recv() waiting for the reply to the next CREATE_RESOURCE
+          * (first Wayland swapchain present).
+          */
+         struct render_context_op_import_resource_request imp_body;
+         const size_t body_offset = offsetof(struct render_context_op_import_resource_request, res_id);
 
          int fds[1];
          int fd_count;
-         if (!server_recv_with_fds(w->socket_fd, &imp_body, sizeof(imp_body),
+         if (!server_recv_with_fds(w->socket_fd, (char *)&imp_body + body_offset,
+                                   sizeof(imp_body) - body_offset,
                                    fds, 1, &fd_count))
             goto done;
 

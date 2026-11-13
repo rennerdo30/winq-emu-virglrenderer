@@ -1326,8 +1326,12 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       return -EINVAL;
 
    ret = ctx->get_blob(ctx, args->res_handle, args->blob_id, args->size, args->blob_flags, &blob);
-   if (ret)
+   if (ret) {
+      virgl_error("create_blob: get_blob failed: ctx %u (capset %u) res %u blob_id %" PRIu64
+                  " size %" PRIu64 " flags 0x%x -> %d\n", args->ctx_id, ctx->capset_id,
+                  args->res_handle, args->blob_id, args->size, args->blob_flags, ret);
       return ret;
+   }
 
    if (blob.type == VIRGL_RESOURCE_OPAQUE_HANDLE) {
       assert(!(args->blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE));
