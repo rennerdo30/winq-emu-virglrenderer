@@ -238,6 +238,14 @@ vkr_log(const char *fmt, ...)
    va_start(va, fmt);
    virgl_prefixed_logv("vkr", VIRGL_LOG_LEVEL_INFO, fmt, va);
    va_end(va);
+
+   /* Also on stderr (QEMU's log): vkr messages explain failed Venus calls. */
+   va_start(va, fmt);
+   fprintf(stderr, "virgl vkr: ");
+   vfprintf(stderr, fmt, va);
+   fputc('\n', stderr);
+   fflush(stderr);
+   va_end(va);
 }
 
 void
