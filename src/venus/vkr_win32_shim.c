@@ -194,7 +194,14 @@ vkr_win32_CreateBuffer(VkDevice device,
    VkExternalMemoryBufferCreateInfo ext_info;
    const VkBufferCreateInfo *create_info = pCreateInfo;
 
-   if (host_type) {
+   /* Do not make buffers external that the guest did not: AMD's Windows
+    * driver limits an OPAQUE_WIN32 external buffer to device-local memory
+    * (memoryTypeBits 0x1 instead of 0xf), so vkMapMemory on a uniform
+    * buffer's memory failed and vkcube wrote through a NULL pointer.
+    * Binding exportable host-visible memory to a plain buffer works
+    * (checked on the host: bind 0, map 0).
+    */
+   if (host_type && false) {
       bool has_external = false;
       for (const VkBaseInStructure *iter = (const VkBaseInStructure *)pCreateInfo->pNext;
            iter; iter = iter->pNext) {

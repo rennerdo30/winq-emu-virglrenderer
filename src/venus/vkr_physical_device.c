@@ -554,6 +554,12 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
    physical_dev->use_host_memory_import = physical_dev->EXT_external_memory_host &&
                                           !physical_dev->KHR_external_memory_fd &&
                                           !physical_dev->EXT_external_memory_dma_buf;
+#ifdef _WIN32
+   /* Host memory import is backed by POSIX shm, which the Windows port does
+    * not have; Windows exports memory as OPAQUE_WIN32 instead (shim above).
+    */
+   physical_dev->use_host_memory_import = false;
+#endif
    if (physical_dev->use_host_memory_import) {
       VkExtensionProperties *new_exts =
          realloc(exts, sizeof(*exts) * (advertised_count + 1));

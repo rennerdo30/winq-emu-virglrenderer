@@ -562,7 +562,16 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          alloc_info->pNext = &local_host_import;
          alloc_info->allocationSize = shm->size;
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
-      } else if (physical_dev->EXT_external_memory_dma_buf) {
+      } else if (physical_dev->EXT_external_memory_dma_buf
+#ifdef _WIN32
+                 /* Windows has no gbm/udmabuf ("minigbm_allocation is not
+                  * enabled", vkAllocateMemory -2 for Wayland swapchain
+                  * images); the dma-buf shim below exports the guest's
+                  * DMA_BUF request as OPAQUE_WIN32 instead.
+                  */
+                 && !(export_info && physical_dev->dma_buf_shim_active)
+#endif
+      ) {
          /* Allocate dma_buf externally and force to import. */
          if (export_info) {
             /* Strip export info since valid_fd_types can only be dma_buf here. */
