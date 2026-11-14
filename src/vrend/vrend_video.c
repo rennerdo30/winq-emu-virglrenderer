@@ -75,7 +75,7 @@
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
 #include "vrend_video.h"
-#include "vrend_iov.h"
+#include "virgl_iov.h"
 #include "virgl_util.h"
 
 /*
@@ -480,7 +480,7 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
          * Copy line-by-line so we can strip any source pitch padding;
          * the guest BO is tightly packed at the plane's natural width.
          * Each plane is its own vrend_resource with its own iov, so
-         * we always write starting at offset 0. `vrend_write_to_iovec`
+         * we always write starting at offset 0. `virgl_write_to_iovec`
          * handles multi-segment iov for us. */
         {
             /* Log every unique res handle we see, so we can compare
@@ -537,7 +537,7 @@ static int sync_cpu_planes_to_video_buffer(struct vrend_video_buffer *buf,
             const char *src_bytes = (const char *)src;
             size_t dst_offset = 0;
             for (uint32_t row = 0; row < num_rows; row++) {
-                vrend_write_to_iovec(res->iov, res->num_iovs, dst_offset,
+                virgl_write_to_iovec(res->iov, res->num_iovs, dst_offset,
                                      src_bytes + (size_t)row * src_byte_pitch,
                                      bytes_per_row);
                 dst_offset += bytes_per_row;

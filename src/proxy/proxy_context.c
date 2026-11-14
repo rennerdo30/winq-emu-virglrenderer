@@ -328,6 +328,8 @@ validate_resource_fd_shm(int fd, uint64_t expected_size)
    }
 #endif
 
+#ifndef _WIN32
+   /* POSIX only: on Windows the shm fd wraps a file mapping, not a file */
    struct stat st;
    if (fstat(fd, &st) < 0) {
       proxy_log("failed to fstat shm fd");
@@ -338,6 +340,9 @@ validate_resource_fd_shm(int fd, uint64_t expected_size)
                 (uint64_t)st.st_size, expected_size);
       return false;
    }
+#else
+   (void)expected_size;
+#endif
 
    return true;
 }

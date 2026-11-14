@@ -9,11 +9,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
-static inline int getpagesize(void) {
-   SYSTEM_INFO si;
-   GetSystemInfo(&si);
-   return (int)si.dwPageSize;
-}
+#include "mman_win32.h"
 #else
 #include <sys/mman.h>
 #include <unistd.h>

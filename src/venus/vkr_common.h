@@ -28,6 +28,19 @@
 #include "util/u_memory.h"
 #include "util/u_pointer.h"
 #include "util/u_thread.h"
+
+#ifdef _WIN32
+#include <windows.h>
+
+/* POSIX getpagesize() for the Windows port (venus aligns blobs to it) */
+static inline int
+getpagesize(void)
+{
+   SYSTEM_INFO si;
+   GetSystemInfo(&si);
+   return (int)si.dwPageSize;
+}
+#endif
 #include "virgl_context.h"
 #include "virgl_util.h"
 #include "virglrenderer.h"
