@@ -514,6 +514,23 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
+      {
+         /* Which allocation the host driver refused: the guest only sees
+          * the error code, and a guest that goes on to use the memory ends
+          * its context (Windows guests, 2026-11-15). */
+         const VkExportMemoryAllocateInfo *e =
+            vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+         const VkMemoryDedicatedAllocateInfo *d =
+            vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+         const VkMemoryAllocateFlagsInfo *f =
+            vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+         vkr_log("vkAllocateMemory failed (%d): size %llu type %u props 0x%x export 0x%x "
+                 "import %d dedicated %s flags 0x%x",
+                 args->ret, (unsigned long long)alloc_info->allocationSize, mem_type_index,
+                 property_flags, e ? e->handleTypes : 0, import_info != NULL,
+                 d ? (d->image ? "image" : d->buffer ? "buffer" : "none") : "no",
+                 f ? f->flags : 0);
+      }
       if (local_import_info.fd >= 0)
          os_close_fd(local_import_info.fd);
 #ifdef _WIN32
@@ -591,7 +608,12 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
    }
 
    vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
-   if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF) {
+   /* Windows hosts have no vkGetMemoryFdPropertiesKHR (it was called through
+    * NULL and QEMU crashed: Windows guests import their dma-buf shared
+    * surfaces, 2026-11-15); their dma-bufs are OPAQUE_WIN32 underneath (the
+    * dma-buf shim), so they take the Win32 path below.
+    */
+   if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF && vk->GetMemoryFdPropertiesKHR) {
       static const VkExternalMemoryHandleTypeFlagBits handle_type =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       VkMemoryFdPropertiesKHR mem_fd_props = {
@@ -606,7 +628,8 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
 
       args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
 #ifdef _WIN32
-   } else if (res->fd_type == VIRGL_RESOURCE_FD_OPAQUE &&
+   } else if ((res->fd_type == VIRGL_RESOURCE_FD_OPAQUE ||
+               res->fd_type == VIRGL_RESOURCE_FD_DMABUF) &&
               dev->GetMemoryWin32HandlePropertiesKHR) {
       HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
       VkMemoryWin32HandlePropertiesKHR props = {
