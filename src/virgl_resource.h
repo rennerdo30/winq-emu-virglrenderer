@@ -58,6 +58,7 @@ struct virgl_resource_vulkan_info {
    uint8_t driver_uuid[16];
    uint64_t allocation_size;
    uint32_t memory_type_index;
+   bool dedicated; /* VkMemoryDedicatedAllocateInfo with an image */
 };
 
 /**

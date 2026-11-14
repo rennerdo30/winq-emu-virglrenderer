@@ -439,6 +439,21 @@ VIRGL_EXPORT int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint3
 VIRGL_EXPORT int
 virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd);
 
+#ifdef _WIN32
+/*
+ * Windows: the blob's memory as a Win32 handle (opaque, for Vulkan or
+ * GL_EXT_memory_object_win32 import). The fds this library hands out are
+ * private to it, so a caller cannot turn them into handles itself. The
+ * returned handle is a duplicate; the caller closes it with CloseHandle().
+ */
+#define VIRGL_RENDERER_WIN32_HANDLE_DEDICATED 0x1 /* dedicated image allocation */
+
+VIRGL_EXPORT int
+virgl_renderer_resource_export_win32_handle(uint32_t res_id, void **handle,
+                                            uint64_t *allocation_size,
+                                            uint32_t *flags);
+#endif
+
 struct virgl_renderer_resource_import_blob_args
 {
    uint32_t res_handle;
