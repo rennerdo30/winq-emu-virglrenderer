@@ -671,7 +671,15 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->gbm_bo = gbm_bo;
    mem->shm = shm;
    mem->allocation_size = alloc_info->allocationSize;
+   /* the driver's index (the memory type spoof may have shifted it from the
+    * guest's): importers of this memory allocate on the host driver
+    */
    mem->memory_type_index = alloc_info->memoryTypeIndex;
+   {
+      const VkMemoryDedicatedAllocateInfo *ded =
+         vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      mem->dedicated = ded && ded->image != VK_NULL_HANDLE;
+   }
 }
 
 static void
@@ -894,6 +902,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
       vulkan_info.allocation_size = mem->allocation_size;
       vulkan_info.memory_type_index = mem->memory_type_index;
+      vulkan_info.dedicated = mem->dedicated;
    } else {
       vkr_log("mem is not exportable");
       return false;

@@ -1569,6 +1569,50 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
    return 0;
 }
 
+#ifdef _WIN32
+int
+virgl_renderer_resource_export_win32_handle(uint32_t res_id, void **out_handle,
+                                            uint64_t *allocation_size,
+                                            uint32_t *flags)
+{
+   TRACE_FUNC();
+   struct virgl_resource *res = virgl_resource_lookup(res_id);
+   HANDLE handle, dup = NULL;
+   int fd = -1;
+
+   if (!res || !out_handle)
+      return -EINVAL;
+
+   switch (virgl_resource_export_fd(res, &fd)) {
+   case VIRGL_RESOURCE_FD_DMABUF:
+   case VIRGL_RESOURCE_FD_OPAQUE:
+   case VIRGL_RESOURCE_FD_SHM:
+      break;
+   case VIRGL_RESOURCE_OPAQUE_HANDLE:
+   case VIRGL_RESOURCE_FD_INVALID:
+      return -EINVAL;
+   }
+
+   handle = os_get_win32_handle_from_fd(fd);
+   if (handle == INVALID_HANDLE_VALUE ||
+       !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup,
+                        0, FALSE, DUPLICATE_SAME_ACCESS))
+      dup = NULL;
+   os_close_fd(fd);
+   if (!dup)
+      return -EINVAL;
+
+   *out_handle = dup;
+   /* Set by the export above; GL import needs the exact allocation. */
+   if (allocation_size)
+      *allocation_size = res->vulkan_info.allocation_size ? res->vulkan_info.allocation_size
+                                                          : res->map_size;
+   if (flags)
+      *flags = res->vulkan_info.dedicated ? VIRGL_RENDERER_WIN32_HANDLE_DEDICATED : 0;
+   return 0;
+}
+#endif
+
 int
 virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_blob_args *args)
 {
