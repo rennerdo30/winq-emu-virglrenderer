@@ -155,10 +155,15 @@ vkr_context_get_resource(struct vkr_context *ctx, uint32_t res_id)
 }
 
 static inline void
-vkr_context_set_fatal(struct vkr_context *ctx)
+vkr_context_set_fatal_at(struct vkr_context *ctx, const char *func, int line)
 {
+   /* Logged: a fatal context ends the guest's Venus ring (Mesa aborts), and
+    * nothing else says why (Windows guests, 2026-11-15). */
+   if (!ctx->cs_fatal_error)
+      vkr_log("context %u fatal at %s:%d", ctx->ctx_id, func, line);
    ctx->cs_fatal_error = true;
 }
+#define vkr_context_set_fatal(ctx) vkr_context_set_fatal_at((ctx), __func__, __LINE__)
 
 static inline bool
 vkr_context_get_fatal(struct vkr_context *ctx)
