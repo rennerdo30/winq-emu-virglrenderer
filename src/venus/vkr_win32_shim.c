@@ -24,7 +24,13 @@
  * real (original) proc table entries.  We maintain a small table of
  * active devices for this purpose.
  */
-#define VKR_WIN32_MAX_DEVICES 8
+/* No fixed limit: a Windows guest keeps many devices at once (compositor,
+ * logon screen, shell, every D3D/Vulkan program); with 8, the ninth got no
+ * shim and QEMU crashed (2026-11-15). Entries are allocated one by one, so a
+ * pointer from vkr_win32_lookup_device stays valid while other devices come
+ * and go; the table itself is shared by every context's ring thread and
+ * guarded by vkr_win32_devices_lock.
+ */
 
 struct vkr_win32_device_entry {
    VkDevice handle;
@@ -36,17 +42,24 @@ struct vkr_win32_device_entry {
    struct vn_device_proc_table saved_proc_table;
 };
 
-static struct vkr_win32_device_entry vkr_win32_devices[VKR_WIN32_MAX_DEVICES];
+static struct vkr_win32_device_entry **vkr_win32_devices;
 static int vkr_win32_device_count;
+static int vkr_win32_device_capacity;
+static SRWLOCK vkr_win32_devices_lock = SRWLOCK_INIT;
 
 static struct vkr_win32_device_entry *
 vkr_win32_lookup_device(VkDevice device)
 {
+   struct vkr_win32_device_entry *found = NULL;
+   AcquireSRWLockShared(&vkr_win32_devices_lock);
    for (int i = 0; i < vkr_win32_device_count; i++) {
-      if (vkr_win32_devices[i].handle == device)
-         return &vkr_win32_devices[i];
+      if (vkr_win32_devices[i]->handle == device) {
+         found = vkr_win32_devices[i];
+         break;
+      }
    }
-   return NULL;
+   ReleaseSRWLockShared(&vkr_win32_devices_lock);
+   return found;
 }
 
 /*
@@ -577,15 +590,12 @@ VKR_WIN32_DEFERRED_DESTROY_SHIM(VkAccelerationStructureKHR, AccelerationStructur
 void
 vkr_win32_device_install_shim(struct vkr_device *dev)
 {
-   if (vkr_win32_device_count >= VKR_WIN32_MAX_DEVICES) {
-      vkr_log("win32 shim: too many devices, shim not installed");
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   struct vkr_win32_device_entry *entry = calloc(1, sizeof(*entry));
+   if (!entry) {
+      vkr_log("win32 shim: out of memory, shim not installed");
       return;
    }
-
-   struct vn_device_proc_table *vk = &dev->proc_table;
-   struct vkr_win32_device_entry *entry =
-      &vkr_win32_devices[vkr_win32_device_count++];
-
    entry->handle = dev->base.handle.device;
    entry->dev = dev;
 
@@ -644,25 +654,47 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
    if (vk->DestroyAccelerationStructureKHR)
       vk->DestroyAccelerationStructureKHR = vkr_win32_DestroyAccelerationStructureKHR;
 
+   AcquireSRWLockExclusive(&vkr_win32_devices_lock);
+   if (vkr_win32_device_count == vkr_win32_device_capacity) {
+      const int capacity = vkr_win32_device_capacity ? vkr_win32_device_capacity * 2 : 16;
+      struct vkr_win32_device_entry **devices =
+         realloc(vkr_win32_devices, capacity * sizeof(*devices));
+      if (!devices) {
+         ReleaseSRWLockExclusive(&vkr_win32_devices_lock);
+         dev->proc_table = entry->saved_proc_table;
+         free(entry);
+         vkr_log("win32 shim: out of memory, shim not installed");
+         return;
+      }
+      vkr_win32_devices = devices;
+      vkr_win32_device_capacity = capacity;
+   }
+   vkr_win32_devices[vkr_win32_device_count++] = entry;
+   ReleaseSRWLockExclusive(&vkr_win32_devices_lock);
 }
 
 void
 vkr_win32_device_remove_shim(struct vkr_device *dev)
 {
+   struct vkr_win32_device_entry *entry = NULL;
+   AcquireSRWLockExclusive(&vkr_win32_devices_lock);
    for (int i = 0; i < vkr_win32_device_count; i++) {
-      if (vkr_win32_devices[i].dev == dev) {
-         struct vkr_win32_device_entry *entry = &vkr_win32_devices[i];
-
-         /* Restore the entire proc table from the saved copy.
-          * This undoes all shim replacements (create, destroy, export, import).
-          */
-         dev->proc_table = entry->saved_proc_table;
-
+      if (vkr_win32_devices[i]->dev == dev) {
+         entry = vkr_win32_devices[i];
          /* Remove from table by swapping with last */
          vkr_win32_devices[i] = vkr_win32_devices[--vkr_win32_device_count];
-         return;
+         break;
       }
    }
+   ReleaseSRWLockExclusive(&vkr_win32_devices_lock);
+   if (!entry)
+      return;
+
+   /* Restore the entire proc table from the saved copy.
+    * This undoes all shim replacements (create, destroy, export, import).
+    */
+   dev->proc_table = entry->saved_proc_table;
+   free(entry);
 }
 
 void
