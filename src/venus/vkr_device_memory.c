@@ -869,7 +869,17 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
    enum virgl_resource_fd_type fd_type;
    VkExternalMemoryHandleTypeFlagBits handle_type;
-   struct virgl_resource_vulkan_info vulkan_info;
+   /* Filled for every export type: Windows exports through the dma_buf
+    * shim too, and consumers there import the memory into Vulkan. */
+   struct virgl_resource_vulkan_info vulkan_info = {
+      .allocation_size = mem->allocation_size,
+      .memory_type_index = mem->memory_type_index,
+      .dedicated = mem->dedicated,
+   };
+   memcpy(vulkan_info.device_uuid, mem->device->physical_device->id_properties.deviceUUID,
+          VK_UUID_SIZE);
+   memcpy(vulkan_info.driver_uuid, mem->device->physical_device->id_properties.driverUUID,
+          VK_UUID_SIZE);
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
       if (!can_export_dma_buf) {
          vkr_log("mem cannot export to dma_buf for cross device blob sharing");

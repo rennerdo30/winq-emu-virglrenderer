@@ -202,10 +202,10 @@ vkr_renderer_create_resource(uint32_t ctx_id,
    *out_res_fd = blob.u.fd;
    *out_map_info = blob.map_info;
 
-   if (blob.type == VIRGL_RESOURCE_FD_OPAQUE) {
-      assert(out_vulkan_info);
+   /* Every type: on Windows the dma_buf type is a shim over a Win32 handle
+    * that the display imports into Vulkan, which needs this info. */
+   if (out_vulkan_info)
       *out_vulkan_info = blob.vulkan_info;
-   }
 
    return true;
 }

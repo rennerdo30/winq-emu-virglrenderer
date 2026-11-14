@@ -1571,16 +1571,15 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
 
 #ifdef _WIN32
 int
-virgl_renderer_resource_export_win32_handle(uint32_t res_id, void **out_handle,
-                                            uint64_t *allocation_size,
-                                            uint32_t *flags)
+virgl_renderer_resource_export_win32(uint32_t res_id,
+                                     struct virgl_renderer_win32_export *out)
 {
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_id);
    HANDLE handle, dup = NULL;
    int fd = -1;
 
-   if (!res || !out_handle)
+   if (!res || !out)
       return -EINVAL;
 
    switch (virgl_resource_export_fd(res, &fd)) {
@@ -1602,13 +1601,15 @@ virgl_renderer_resource_export_win32_handle(uint32_t res_id, void **out_handle,
    if (!dup)
       return -EINVAL;
 
-   *out_handle = dup;
-   /* Set by the export above; GL import needs the exact allocation. */
-   if (allocation_size)
-      *allocation_size = res->vulkan_info.allocation_size ? res->vulkan_info.allocation_size
-                                                          : res->map_size;
-   if (flags)
-      *flags = res->vulkan_info.dedicated ? VIRGL_RENDERER_WIN32_HANDLE_DEDICATED : 0;
+   /* vulkan_info is filled in when venus exports the memory (above). */
+   memset(out, 0, sizeof(*out));
+   out->handle = dup;
+   out->allocation_size = res->vulkan_info.allocation_size ? res->vulkan_info.allocation_size
+                                                           : res->map_size;
+   out->memory_type_index = res->vulkan_info.memory_type_index;
+   out->flags = res->vulkan_info.dedicated ? VIRGL_RENDERER_WIN32_HANDLE_DEDICATED : 0;
+   memcpy(out->device_uuid, res->vulkan_info.device_uuid, sizeof(out->device_uuid));
+   memcpy(out->driver_uuid, res->vulkan_info.driver_uuid, sizeof(out->driver_uuid));
    return 0;
 }
 #endif

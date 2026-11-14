@@ -155,7 +155,9 @@ virgl_resource_create_from_fd(uint32_t res_id,
    res->iov = iov;
    res->iov_count = iov_count;
 
-   if (vulkan_info && fd_type == VIRGL_RESOURCE_FD_OPAQUE)
+   /* Kept for every fd type: on Windows the dma_buf type is a shim over the
+    * same Win32 handle, and the display imports it into Vulkan. */
+   if (vulkan_info)
       res->vulkan_info = *vulkan_info;
 
    return res;

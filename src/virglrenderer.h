@@ -448,10 +448,18 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
  */
 #define VIRGL_RENDERER_WIN32_HANDLE_DEDICATED 0x1 /* dedicated image allocation */
 
+struct virgl_renderer_win32_export {
+   void *handle;                 /* VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT */
+   uint64_t allocation_size;     /* the exact VkMemoryAllocateInfo size */
+   uint32_t memory_type_index;   /* on the device below */
+   uint32_t flags;               /* VIRGL_RENDERER_WIN32_HANDLE_* */
+   uint8_t device_uuid[16];      /* VkPhysicalDeviceIDProperties::deviceUUID */
+   uint8_t driver_uuid[16];
+};
+
 VIRGL_EXPORT int
-virgl_renderer_resource_export_win32_handle(uint32_t res_id, void **handle,
-                                            uint64_t *allocation_size,
-                                            uint32_t *flags);
+virgl_renderer_resource_export_win32(uint32_t res_id,
+                                     struct virgl_renderer_win32_export *out);
 #endif
 
 struct virgl_renderer_resource_import_blob_args
