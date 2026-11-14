@@ -102,6 +102,15 @@ bool has_eventfd(void)
 #endif
 }
 
+/*
+ * Windows has no eventfd, and the C runtime cannot wrap an event handle in a
+ * file descriptor: _open_osfhandle() refuses handles that are not files
+ * (EBADF), so the old emulation failed every time. Here the "eventfd" is the
+ * event HANDLE itself. Kernel handles are 32-bit significant by contract (for
+ * 32/64-bit interop), so the value fits an int and is always positive.
+ * Such an fd must only be used through the *_eventfd helpers below, never
+ * with read(), write(), close() or _get_osfhandle().
+ */
 int create_eventfd(unsigned int initval)
 {
 #ifdef HAVE_EVENTFD_H
@@ -110,13 +119,33 @@ int create_eventfd(unsigned int initval)
    HANDLE event = CreateEventA(NULL, TRUE, initval ? TRUE : FALSE, NULL);
    if (!event)
       return -1;
-   int fd = _open_osfhandle((intptr_t)event, 0);
-   if (fd < 0)
+   intptr_t value = (intptr_t)event;
+   if (value <= 0 || value > INT32_MAX) {
       CloseHandle(event);
-   return fd;
+      return -1;
+   }
+   return (int)value;
 #else
    (void)initval;
    return -1;
+#endif
+}
+
+#ifdef _WIN32
+void *eventfd_handle(int fd)
+{
+   return fd >= 0 ? (HANDLE)(intptr_t)fd : NULL;
+}
+#endif
+
+void close_eventfd(int fd)
+{
+   if (fd < 0)
+      return;
+#ifdef _WIN32
+   CloseHandle((HANDLE)(intptr_t)fd);
+#else
+   close(fd);
 #endif
 }
 
@@ -124,8 +153,8 @@ int write_eventfd(int fd, uint64_t val)
 {
 #ifdef _WIN32
    (void)val;
-   HANDLE event = (HANDLE)_get_osfhandle(fd);
-   if (event == INVALID_HANDLE_VALUE)
+   HANDLE event = eventfd_handle(fd);
+   if (!event)
       return -1;
    return SetEvent(event) ? 0 : -1;
 #else
@@ -151,8 +180,8 @@ int write_eventfd(int fd, uint64_t val)
 void flush_eventfd(int fd)
 {
 #ifdef _WIN32
-   HANDLE event = (HANDLE)_get_osfhandle(fd);
-   if (event != INVALID_HANDLE_VALUE)
+   HANDLE event = eventfd_handle(fd);
+   if (event)
       ResetEvent(event);
 #else
     ssize_t len;

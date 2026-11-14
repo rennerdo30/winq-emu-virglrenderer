@@ -70,9 +70,16 @@ struct hash_entry *hash_table_search(struct hash_table *ht, uint32_t key);
 bool equal_func(const void *key1, const void *key2);
 
 bool has_eventfd(void);
+/* On Windows an eventfd is an event HANDLE stored in an int: use only these
+ * helpers on it (see virgl_util.c). */
 int create_eventfd(unsigned int initval);
 int write_eventfd(int fd, uint64_t val);
 void flush_eventfd(int fd);
+void close_eventfd(int fd);
+#ifdef _WIN32
+/* The event HANDLE behind an eventfd (NULL for -1). */
+void *eventfd_handle(int fd);
+#endif
 
 /*
  * Returns true once WINQ_DIAG=1 (or any non-empty, non-"0" value) has been

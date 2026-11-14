@@ -179,7 +179,7 @@ proxy_context_sync_thread(void *arg)
 
    while (!ctx->sync_thread.stop) {
 #ifdef _WIN32
-      HANDLE event = (HANDLE)_get_osfhandle(ctx->sync_thread.fence_eventfd);
+      HANDLE event = eventfd_handle(ctx->sync_thread.fence_eventfd);
       DWORD wait_ret = WaitForSingleObject(event, 100); /* 100ms timeout */
       if (wait_ret == WAIT_FAILED) {
          proxy_log("failed to wait on fence event");
@@ -546,7 +546,7 @@ proxy_context_destroy(struct virgl_context *base)
          thrd_join(ctx->sync_thread.thread, NULL);
       }
 
-      os_close_fd(ctx->sync_thread.fence_eventfd);
+      close_eventfd(ctx->sync_thread.fence_eventfd);
    }
 
    if (ctx->shmem.ptr)

@@ -7467,7 +7467,7 @@ static void vrend_renderer_use_threaded_sync(void)
 
    vrend_state.sync_thread = u_thread_create(thread_sync, NULL);
    if (!vrend_state.sync_thread) {
-      close(vrend_state.eventfd);
+      close_eventfd(vrend_state.eventfd);
       vrend_state.eventfd = -1;
       vrend_clicbs->destroy_gl_context_surfaceless(vrend_state.sync_context);
       cnd_destroy(&vrend_state.fence_cond);
@@ -7826,7 +7826,7 @@ vrend_renderer_fini(void)
    vrend_state.finishing = true;
 
    if (vrend_state.eventfd != -1) {
-      close(vrend_state.eventfd);
+      close_eventfd(vrend_state.eventfd);
       vrend_state.eventfd = -1;
    }
 
