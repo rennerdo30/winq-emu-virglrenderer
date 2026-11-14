@@ -187,6 +187,84 @@ vkr_physical_device_init_id_properties(struct vkr_physical_device *physical_dev)
       host_props.minImportedHostPointerAlignment;
 }
 
+#ifdef _WIN32
+/* Windows: host-visible memory reaches the guest only as an exportable
+ * (OPAQUE_WIN32) allocation, and some memory types cannot be exported at all:
+ * AMD refuses every DEVICE_LOCAL | HOST_VISIBLE type (the resizable-BAR heap)
+ * with VK_ERROR_OUT_OF_DEVICE_MEMORY. A guest that picks such a type gets no
+ * memory, binds it anyway and loses its Venus context (Windows guests: the
+ * desktop compositor aborted in a loop, 2026-11-15). So try one exportable
+ * allocation per host-visible type and hide the host-visible flags of the
+ * types that fail; the guest then maps memory from a type that works.
+ */
+static void
+vkr_physical_device_hide_unexportable_memory_types(struct vkr_physical_device *physical_dev)
+{
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+   VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+   VkPhysicalDeviceMemoryProperties *mp = &physical_dev->memory_properties;
+
+   if (!physical_dev->host_external_memory_win32)
+      return;
+
+   const float priority = 1.0f;
+   const VkDeviceQueueCreateInfo queue_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = 0,
+      .queueCount = 1,
+      .pQueuePriorities = &priority,
+   };
+   const char *const exts[] = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME };
+   const VkDeviceCreateInfo dev_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &queue_info,
+      .enabledExtensionCount = 1,
+      .ppEnabledExtensionNames = exts,
+   };
+   VkDevice dev;
+   if (vk->CreateDevice(handle, &dev_info, NULL, &dev) != VK_SUCCESS) {
+      vkr_log("memory type probe: no device");
+      return;
+   }
+   PFN_vkAllocateMemory alloc =
+      (PFN_vkAllocateMemory)vk->GetDeviceProcAddr(dev, "vkAllocateMemory");
+   PFN_vkFreeMemory free_mem =
+      (PFN_vkFreeMemory)vk->GetDeviceProcAddr(dev, "vkFreeMemory");
+   PFN_vkDestroyDevice destroy =
+      (PFN_vkDestroyDevice)vk->GetDeviceProcAddr(dev, "vkDestroyDevice");
+
+   for (uint32_t i = 0; alloc && free_mem && i < mp->memoryTypeCount; i++) {
+      VkMemoryType *type = &mp->memoryTypes[i];
+      if (!(type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+         continue;
+      const VkExportMemoryAllocateInfo export_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      };
+      const VkMemoryAllocateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .pNext = &export_info,
+         .allocationSize = 65536,
+         .memoryTypeIndex = i,
+      };
+      VkDeviceMemory mem;
+      const VkResult result = alloc(dev, &info, NULL, &mem);
+      if (result == VK_SUCCESS) {
+         free_mem(dev, mem, NULL);
+         continue;
+      }
+      vkr_log("memory type %u (flags 0x%x) cannot be exported (%d): not host-visible for guests",
+              i, type->propertyFlags, result);
+      type->propertyFlags &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+   }
+   if (destroy)
+      destroy(dev, NULL);
+}
+#endif
+
 static void
 vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_dev)
 {
@@ -194,6 +272,9 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
 
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+#ifdef _WIN32
+   vkr_physical_device_hide_unexportable_memory_types(physical_dev);
+#endif
 
    if (!VKR_DEBUG(NO_MEM_TYPE_SPOOF)) {
       VkPhysicalDeviceMemoryProperties *p = &physical_dev->memory_properties;
@@ -954,6 +1035,11 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
                                              args->pMemoryProperties);
+      /* The memory types as the guest may use them (see
+       * vkr_physical_device_hide_unexportable_memory_types); pNext (budget)
+       * stays the host's.
+       */
+      args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
    }
 
    /* VkPhysicalDeviceMemoryProperties is invariant. Always return the cached
