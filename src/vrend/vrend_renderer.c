@@ -8623,7 +8623,7 @@ static void vrend_resource_d3d_init(UNUSED struct vrend_resource *gr, UNUSED uin
 
 fail:
    if (d3d_tex2d)
-      d3d_tex2d->lpVtbl->Release(gr->d3d_tex2d);
+      d3d_tex2d->lpVtbl->Release(d3d_tex2d);
    gr->d3d_tex2d = NULL;
 #endif
 }
@@ -13375,13 +13375,11 @@ vrend_renderer_resource_d3d11_texture2d(struct pipe_resource *pres, void **d3d_t
 #ifdef WIN32
    struct vrend_resource *res = (struct vrend_resource *)pres;
 
-   if (!vrend_state.d3d_share_texture)
-      return 0;
-
-   if (!res->d3d_tex2d)
-      return EINVAL;
-
-   *d3d_tex2d = res->d3d_tex2d;
+   /* Only scanout resources get a shared D3D11 texture
+    * (vrend_resource_d3d_init). Any other resource, such as a guest 2D
+    * framebuffer, reports none: the caller then shows the GL texture.
+    * Failing here made SET_SCANOUT reject valid resources. */
+   *d3d_tex2d = vrend_state.d3d_share_texture ? res->d3d_tex2d : NULL;
    return 0;
 #else
    (void)pres;
