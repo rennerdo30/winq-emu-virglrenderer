@@ -196,10 +196,10 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
-      munmap(res->u.data, res->size);
-   else if (res->u.fd >= 0)
+   if (res->fd_valid)
       os_close_fd(res->u.fd);
+   else if (res->u.data)
+      munmap(res->u.data, res->size);
    free(res);
 }
 
@@ -247,10 +247,11 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
 
    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
    assert(fd < 0 || !mmap_ptr);
-   if (mmap_ptr)
-      res->u.data = mmap_ptr;
-   else
+   res->fd_valid = fd >= 0;
+   if (res->fd_valid)
       res->u.fd = fd;
+   else
+      res->u.data = mmap_ptr;
 
    if (!vkr_context_add_resource(ctx, res)) {
       free(res);
@@ -268,6 +269,16 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
 {
    assert(!vkr_context_get_resource(ctx, res_id));
 
+#ifdef __APPLE__
+   /* The shm resource is imported for guest side external memory sharing, and must
+    * only hold the fd.
+    */
+   return vkr_context_import_resource_internal(ctx, res_id, blob_size,
+                                               VIRGL_RESOURCE_FD_SHM, fd, NULL);
+#else
+   /* The shm resource is imported for venus internal use (e.g. guest vram mode), and
+    * must only hold the mapping.
+    */
    void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
    if (mmap_ptr == MAP_FAILED)
       return false;
@@ -280,6 +291,7 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
 
    close(fd);
    return true;
+#endif /* __APPLE__ */
 }
 
 static bool
@@ -345,12 +357,13 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       return false;
    }
 
-   /* If memory might get exported, store a dup'ed fd in vkr_resource for:
-    * - vkAllocateMemory for dma_buf import
-    * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+   /* If memory might get exported for external memory sharing purpose, store a
+    * dup'ed fd in vkr_resource for:
+    * - vkAllocateMemory for external memory re-import
+    * - vkGetMemoryResourcePropertiesMESA for properties query
     */
    int res_fd = -1;
-   if (mem->might_export) {
+   if (mem->might_export_to_share) {
       res_fd = os_dupfd_cloexec(blob.u.fd);
       if (res_fd < 0) {
          os_close_fd(blob.u.fd);

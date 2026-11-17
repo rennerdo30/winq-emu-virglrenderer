@@ -385,7 +385,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          exts[host_ext_count++] = host_name;
    }
 
-   if (physical_dev->use_host_memory_import &&
+   if (physical_dev->EXT_external_memory_host &&
        !vkr_device_has_extension(exts, host_ext_count,
                                  VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
       exts[host_ext_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
@@ -505,7 +505,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
                               args->pCreateInfo->ppEnabledExtensionNames,
                               args->pCreateInfo->enabledExtensionCount);
 
-   if (physical_dev->use_host_memory_import) {
+   if (physical_dev->EXT_external_memory_host) {
       dev->GetMemoryHostPointerPropertiesEXT =
          (PFN_vkGetMemoryHostPointerPropertiesEXT)vk->GetDeviceProcAddr(
             dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");

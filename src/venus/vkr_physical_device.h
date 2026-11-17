@@ -30,11 +30,6 @@ struct vkr_physical_device {
 
    bool EXT_external_memory_host;
 
-   /* the host cannot export memory as an fd, so memory the guest may map is
-    * POSIX shm imported as host memory
-    */
-   bool use_host_memory_import;
-   VkDeviceSize min_imported_host_pointer_alignment;
    bool host_external_memory_win32;
    bool host_external_fence_win32;
    bool host_external_semaphore_win32;
@@ -60,6 +55,7 @@ struct vkr_physical_device {
    VkPhysicalDeviceMemoryProperties memory_properties;
    bool mem_type_spoof;
    VkPhysicalDeviceIDProperties id_properties;
+   VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_ptr_props;
    bool is_dma_buf_fd_export_supported;
    bool is_opaque_fd_export_supported;
    void *gbm_device;

@@ -9,19 +9,14 @@
 #include "vkr_common.h"
 
 struct gbm_bo;
-/* POSIX shm imported as host memory, backing memory the guest can map */
-struct vkr_shm {
-   int fd;
-   void *ptr;
-   size_t size;
-};
+struct vkr_shm;
 
 struct vkr_device_memory {
    struct vkr_object base;
 
    struct vkr_device *device;
 
-   bool might_export;
+   bool might_export_to_share;
 
    uint32_t property_flags;
    uint32_t valid_fd_types;

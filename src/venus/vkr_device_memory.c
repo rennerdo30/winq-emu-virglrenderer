@@ -12,6 +12,7 @@
 #include "mman_win32.h"
 #else
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -22,97 +23,6 @@
 
 #include "vkr_device_memory_gen.h"
 #include "vkr_physical_device.h"
-
-static bool
-vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
-                                   struct vkr_device *dev,
-                                   const VkImportMemoryResourceInfoMESA *res_info,
-                                   VkImportMemoryFdInfoKHR *out_fd,
-#ifdef _WIN32
-                                   VkImportMemoryWin32HandleInfoKHR *out_win32,
-#endif
-                                   const void **out_import_info)
-{
-   struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
-   if (!res) {
-      vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
-      vkr_context_set_fatal(ctx);
-      return false;
-   }
-
-   VkExternalMemoryHandleTypeFlagBits handle_type;
-   switch (res->fd_type) {
-   case VIRGL_RESOURCE_FD_DMABUF:
-#ifdef _WIN32
-      /*
-       * The dma-buf shim stores Win32 HANDLEs wrapped as fds in "dma-buf"
-       * resources. Unwrap and import as OPAQUE_WIN32 — the only handle
-       * type the Windows ICD understands — while keeping the guest's
-       * DMA_BUF viewpoint on its side of the wire.
-       */
-      if (dev->physical_device->dma_buf_shim_active) {
-         HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
-         HANDLE dup_handle = NULL;
-         if (handle == INVALID_HANDLE_VALUE ||
-             !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
-                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            return false;
-         }
-
-         *out_win32 = (VkImportMemoryWin32HandleInfoKHR){
-            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
-            .pNext = res_info->pNext,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-            .handle = dup_handle,
-            .name = NULL,
-         };
-         *out_import_info = out_win32;
-         return true;
-      }
-#endif
-      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      break;
-   case VIRGL_RESOURCE_FD_OPAQUE:
-#ifdef _WIN32
-      if (dev->physical_device->host_external_memory_win32) {
-         HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
-         HANDLE dup_handle = NULL;
-         if (handle == INVALID_HANDLE_VALUE ||
-             !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
-                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            return false;
-         }
-
-         *out_win32 = (VkImportMemoryWin32HandleInfoKHR){
-            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
-            .pNext = res_info->pNext,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-            .handle = dup_handle,
-            .name = NULL,
-         };
-         *out_import_info = out_win32;
-         return true;
-      }
-#endif
-      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-      break;
-   default:
-      return false;
-   }
-
-   int fd = os_dupfd_cloexec(res->u.fd);
-   if (fd < 0)
-      return false;
-
-   *out_fd = (VkImportMemoryFdInfoKHR){
-      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-      .pNext = res_info->pNext,
-      .fd = fd,
-      .handleType = handle_type,
-   };
-   *out_import_info = out_fd;
-   return true;
-}
 
 #if defined(HAVE_LINUX_UDMABUF_H) && defined(HAVE_MEMFD_CREATE)
 #include <fcntl.h>
@@ -166,7 +76,7 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
       goto fail;
    }
 
-   os_close_fd(memfd);
+   close(memfd);
 
    *out_udmabuf_fd = udmabuf_fd;
    *out_fd_info = (VkImportMemoryFdInfoKHR){
@@ -180,9 +90,9 @@ vkr_udmabuf_get_fd_info_from_allocation_info(struct vkr_physical_device *physica
 
 fail:
    if (udmabuf_fd >= 0)
-      os_close_fd(udmabuf_fd);
+      close(udmabuf_fd);
    if (memfd >= 0)
-      os_close_fd(memfd);
+      close(memfd);
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
@@ -308,6 +218,14 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys
 
 #endif /* ENABLE_GBM_ALLOCATION */
 
+/* POSIX shm imported as host memory, backing memory the guest can map */
+struct vkr_shm {
+   int fd;
+   void *ptr;
+   size_t size;
+};
+
+#ifndef _WIN32
 /* Map the whole of fd at an address aligned to alignment, which may exceed
  * what mmap guarantees: reserve a window large enough to hold an aligned
  * range, map the fd over that range and release the slack around it.
@@ -340,17 +258,28 @@ vkr_shm_map_aligned(int fd, size_t size, size_t alignment)
    return ptr;
 }
 
+/* Create a shm for host memory import. With a valid fd, the existing shm behind it is
+ * mapped again instead, and the fd remains owned by the caller.
+ */
 static struct vkr_shm *
-vkr_shm_alloc(uint64_t size, uint64_t alignment)
+vkr_shm_create(int fd, uint64_t size, uint64_t alignment)
 {
    alignment = MAX2(alignment, (uint64_t)getpagesize());
    const size_t aligned_size = align64(size, alignment);
+
+   if (fd >= 0) {
+      /* the aligned size must be backed by the existing shm as well */
+      struct stat st;
+      if (fstat(fd, &st) || st.st_size < 0 || (uint64_t)st.st_size < aligned_size)
+         return NULL;
+   }
 
    struct vkr_shm *shm = calloc(1, sizeof(*shm));
    if (!shm)
       return NULL;
 
-   shm->fd = os_create_anonymous_file(aligned_size, "vkr-host-mem");
+   shm->fd = fd < 0 ? os_create_anonymous_file(aligned_size, "vkr-host-mem")
+                    : os_dupfd_cloexec(fd);
    if (shm->fd < 0) {
       free(shm);
       return NULL;
@@ -368,7 +297,7 @@ vkr_shm_alloc(uint64_t size, uint64_t alignment)
 }
 
 static void
-vkr_shm_free(struct vkr_shm *shm)
+vkr_shm_destroy(struct vkr_shm *shm)
 {
    if (!shm)
       return;
@@ -376,6 +305,390 @@ vkr_shm_free(struct vkr_shm *shm)
    munmap(shm->ptr, shm->size);
    close(shm->fd);
    free(shm);
+}
+
+static VkResult
+vkr_shm_get_host_ptr_info_from_allocation_info(
+   struct vkr_device *dev,
+   const VkMemoryAllocateInfo *alloc_info,
+   struct vkr_shm **out_shm,
+   VkImportMemoryHostPointerInfoEXT *out_host_ptr_info)
+{
+   const struct vkr_physical_device *physical_dev = dev->physical_device;
+   const VkDeviceSize alignment =
+      physical_dev->host_ptr_props.minImportedHostPointerAlignment;
+   struct vkr_shm *shm = vkr_shm_create(-1, alloc_info->allocationSize, alignment);
+   if (!shm)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   /* Drivers tend to only report cached memory types for host pointer import, so
+    * that they don't have to reason about the cache mode associated with the
+    * imported pages. Since none of the hw drivers assigns different VA space for
+    * coherent vs cached memory types, the import can be safely routed to the
+    * non-cached memory types as well:
+    * - for VM setup, coherency is maintained by the hypervisor, according to the
+    *   cache mode picked when setting up the nested pages
+    * - for vtest setup, it's at best effort since cache management is not wired
+    *   over the vtest protocol
+    *
+    * So the reported memory types are only checked for debugging purposes.
+    */
+   if (VKR_DEBUG(HOST_PTR)) {
+      VkMemoryHostPointerPropertiesEXT host_props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+      };
+      const VkResult result = dev->GetMemoryHostPointerPropertiesEXT(
+         dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+         shm->ptr, &host_props);
+      /* alloc_info->memoryTypeIndex is the driver's index, which the memory
+       * type spoof may have shifted from the one the guest asked for
+       */
+      if (result != VK_SUCCESS ||
+          !(host_props.memoryTypeBits & (1u << alloc_info->memoryTypeIndex))) {
+         vkr_log("host memory import is unsupported for memory type %u "
+                 "(vk ret %d, memoryTypeBits 0x%x)",
+                 alloc_info->memoryTypeIndex, result, host_props.memoryTypeBits);
+      }
+   }
+
+   *out_shm = shm;
+   *out_host_ptr_info = (VkImportMemoryHostPointerInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+      .pNext = alloc_info->pNext,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+      .pHostPointer = shm->ptr,
+   };
+
+   return VK_SUCCESS;
+}
+
+#else /* _WIN32 */
+
+/* Windows has no POSIX shm. Host memory import is never chosen there (memory
+ * is exported as OPAQUE_WIN32 instead), so these only fail.
+ */
+static struct vkr_shm *
+vkr_shm_create(UNUSED int fd, UNUSED uint64_t size, UNUSED uint64_t alignment)
+{
+   return NULL;
+}
+
+static void
+vkr_shm_destroy(struct vkr_shm *shm)
+{
+   free(shm);
+}
+
+static VkResult
+vkr_shm_get_host_ptr_info_from_allocation_info(
+   UNUSED struct vkr_device *dev,
+   UNUSED const VkMemoryAllocateInfo *alloc_info,
+   UNUSED struct vkr_shm **out_shm,
+   UNUSED VkImportMemoryHostPointerInfoEXT *out_host_ptr_info)
+{
+   vkr_log("host memory import is not supported on Windows");
+   return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+#endif /* _WIN32 */
+
+struct vkr_blob_mem_info {
+   VkImportMemoryFdInfoKHR fd;
+   void *gbm_bo;
+   int udmabuf_fd;
+
+   VkImportMemoryHostPointerInfoEXT host_ptr;
+   struct vkr_shm *shm;
+
+#ifdef _WIN32
+   /* import of a Win32 HANDLE; the handle is ours to close */
+   VkImportMemoryWin32HandleInfoKHR win32;
+#endif
+
+   VkExportMemoryAllocateInfo export;
+
+   uint32_t valid_fd_types;
+};
+
+static bool
+vkr_fix_import_info(struct vkr_context *ctx,
+                    const struct vkr_physical_device *physical_dev,
+                    VkMemoryAllocateInfo *alloc_info,
+                    void *prev_of_res_info,
+                    struct vkr_blob_mem_info *local_info)
+{
+   const VkImportMemoryResourceInfoMESA *res_info = vkr_pnext_get_next(prev_of_res_info);
+   struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
+   if (!res) {
+      vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
+      vkr_context_set_fatal(ctx);
+      return false;
+   }
+
+   if (!res->fd_valid)
+      return false;
+
+#ifdef _WIN32
+   /* The dma-buf shim's dma-bufs and the opaque fds are Win32 HANDLEs wrapped
+    * as fds. Import them as OPAQUE_WIN32, the only handle type the Windows
+    * driver understands; the guest keeps its DMA_BUF or OPAQUE_FD view.
+    */
+   if ((res->fd_type == VIRGL_RESOURCE_FD_DMABUF && physical_dev->dma_buf_shim_active) ||
+       (res->fd_type == VIRGL_RESOURCE_FD_OPAQUE && physical_dev->host_external_memory_win32)) {
+      HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
+      HANDLE dup_handle = NULL;
+      if (handle == INVALID_HANDLE_VALUE ||
+          !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle, 0,
+                           FALSE, DUPLICATE_SAME_ACCESS))
+         return false;
+
+      local_info->win32 = (VkImportMemoryWin32HandleInfoKHR){
+         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+         .pNext = res_info->pNext,
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+         .handle = dup_handle,
+      };
+      vkr_pnext_set_next(prev_of_res_info, &local_info->win32);
+      return true;
+   }
+#endif
+
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
+      if (!physical_dev->EXT_external_memory_host)
+         return false;
+
+      const VkDeviceSize alignment =
+         physical_dev->host_ptr_props.minImportedHostPointerAlignment;
+      struct vkr_shm *shm = vkr_shm_create(res->u.fd, res->size, alignment);
+      if (!shm || alloc_info->allocationSize > shm->size) {
+         vkr_shm_destroy(shm);
+         return false;
+      }
+
+      local_info->shm = shm;
+      local_info->host_ptr = (VkImportMemoryHostPointerInfoEXT){
+         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+         .pNext = res_info->pNext,
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+         .pHostPointer = shm->ptr,
+      };
+      vkr_pnext_set_next(prev_of_res_info, &local_info->host_ptr);
+      alloc_info->allocationSize = shm->size;
+      return true;
+   }
+
+   VkExternalMemoryHandleTypeFlagBits handle_type;
+   switch (res->fd_type) {
+   case VIRGL_RESOURCE_FD_DMABUF:
+      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      break;
+   case VIRGL_RESOURCE_FD_OPAQUE:
+      handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      break;
+   default:
+      return false;
+   }
+
+   int fd = os_dupfd_cloexec(res->u.fd);
+   if (fd < 0)
+      return false;
+
+   local_info->fd = (VkImportMemoryFdInfoKHR){
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+      .pNext = res_info->pNext,
+      .fd = fd,
+      .handleType = handle_type,
+   };
+   vkr_pnext_set_next(prev_of_res_info, &local_info->fd);
+   return true;
+}
+
+static VkResult
+vkr_fix_export_info(struct vkr_device *dev,
+                    VkMemoryAllocateInfo *alloc_info,
+                    bool is_import,
+                    void *prev_of_export_info,
+                    struct vkr_blob_mem_info *local_info)
+{
+   struct vkr_physical_device *physical_dev = dev->physical_device;
+   const VkExportMemoryAllocateInfo *export_info =
+      vkr_pnext_get_next(prev_of_export_info);
+
+   /* strip the original export_info from the pNext chain */
+   vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
+
+   if (is_import || !export_info->handleTypes)
+      return VK_SUCCESS;
+
+#ifdef _WIN32
+   /* The Windows driver exports OPAQUE_WIN32 only. A guest DMA_BUF export
+    * (the dma-buf shim) or OPAQUE_FD export becomes an OPAQUE_WIN32 export on
+    * the host, and the guest keeps the handle type it asked for.
+    */
+   if (physical_dev->host_external_memory_win32) {
+      uint32_t fd_types = 0;
+      if ((export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+          physical_dev->dma_buf_shim_active)
+         fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
+      if (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+         fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
+      if (fd_types) {
+         local_info->export = (VkExportMemoryAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            .pNext = alloc_info->pNext,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+         };
+         alloc_info->pNext = &local_info->export;
+         local_info->valid_fd_types = fd_types;
+         return VK_SUCCESS;
+      }
+   }
+#endif
+
+   if ((export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+       physical_dev->is_dma_buf_fd_export_supported) {
+      local_info->export = (VkExportMemoryAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .pNext = alloc_info->pNext,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      };
+      alloc_info->pNext = &local_info->export;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+      return VK_SUCCESS;
+   }
+
+   if (physical_dev->gbm_device) {
+      assert(physical_dev->EXT_external_memory_dma_buf);
+      const VkResult result = vkr_gbm_get_fd_info_from_allocation_info(
+         physical_dev, alloc_info, &local_info->gbm_bo, &local_info->fd);
+      if (result != VK_SUCCESS)
+         return result;
+
+      alloc_info->pNext = &local_info->fd;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+      return VK_SUCCESS;
+   }
+
+#ifdef __APPLE__
+   if (physical_dev->EXT_external_memory_host) {
+      const VkResult result = vkr_shm_get_host_ptr_info_from_allocation_info(
+         dev, alloc_info, &local_info->shm, &local_info->host_ptr);
+      if (result != VK_SUCCESS)
+         return result;
+
+      alloc_info->pNext = &local_info->host_ptr;
+      alloc_info->allocationSize = local_info->shm->size;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+      return VK_SUCCESS;
+   }
+#endif
+
+   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+static VkResult
+vkr_fix_mappable_info(struct vkr_device *dev,
+                      VkMemoryAllocateInfo *alloc_info,
+                      struct vkr_blob_mem_info *local_info)
+{
+   /* XXX Force external memory export or import until a new extension that supports
+    * direct export from host visible memory.
+    *
+    * Most VkImage and VkBuffer are non-external while most VkDeviceMemory are external
+    * if allocated with a host visible memory type. We still violate the spec by binding
+    * external memory to non-external image or buffer, which needs spec changes with a
+    * new extension.
+    */
+   struct vkr_physical_device *physical_dev = dev->physical_device;
+   const bool force_gbm_import = !!physical_dev->gbm_device;
+   const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
+   const bool support_export = physical_dev->is_dma_buf_fd_export_supported ||
+                               physical_dev->is_opaque_fd_export_supported;
+   const bool use_host_ptr_import =
+      physical_dev->EXT_external_memory_host && !support_export;
+
+   if (force_udmabuf_import) {
+      /* To be noted, there are 2 limits for udmabuf:
+       * - list_limit: udmabuf_create_list->count limit. Default is 1024.
+       * - size_limit_mb: Max size of a dmabuf, in megabytes. Default is 64.
+       */
+      const VkResult result = vkr_udmabuf_get_fd_info_from_allocation_info(
+         physical_dev, alloc_info, &local_info->udmabuf_fd, &local_info->fd);
+      if (result != VK_SUCCESS)
+         return result;
+
+      alloc_info->pNext = &local_info->fd;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+      return VK_SUCCESS;
+   }
+
+   if (force_gbm_import) {
+      const VkResult result = vkr_gbm_get_fd_info_from_allocation_info(
+         physical_dev, alloc_info, &local_info->gbm_bo, &local_info->fd);
+      if (result != VK_SUCCESS)
+         return result;
+
+      alloc_info->pNext = &local_info->fd;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+      return VK_SUCCESS;
+   }
+
+   if (use_host_ptr_import) {
+      const VkResult result = vkr_shm_get_host_ptr_info_from_allocation_info(
+         dev, alloc_info, &local_info->shm, &local_info->host_ptr);
+      if (result != VK_SUCCESS)
+         return result;
+
+      alloc_info->pNext = &local_info->host_ptr;
+      alloc_info->allocationSize = local_info->shm->size;
+      local_info->valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+      return VK_SUCCESS;
+   }
+
+   if (support_export) {
+      VkExternalMemoryHandleTypeFlagBits handle_type;
+      enum virgl_resource_fd_type fd_type;
+
+      if (physical_dev->is_dma_buf_fd_export_supported) {
+         handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         fd_type = VIRGL_RESOURCE_FD_DMABUF;
+      } else {
+         handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+         fd_type = VIRGL_RESOURCE_FD_OPAQUE;
+
+         /* Guest virtgpu kernel aligns up blob mem size to the page boundary. No
+          * matter dma-buf or opaque fd export allocation, the actual allocation
+          * in most cases would follow the same padding. For dma-buf, we are able
+          * to allocate and validate via lseek below. For opaque fd, Vulkan spec
+          * requires to use the same size with allocation time for the mapper,
+          * either vkr_allocator or vulkano, to import and populate the mapping.
+          * Accessible mapping given by vkMapMemory is normally limited to just the
+          * alloc size. When KVM register the mappings to guest pci bar, that
+          * involves an invalid chunk towards the end of the page boundary. As a
+          * result, any guest side accelerated instructions that rely on the
+          * paddings can end up with Illegal instruction error. The most common
+          * trigger is via memcpy'ing valid range to the guest side mapped buffer
+          * memory, and then, e.g. __memcpy_avx_unaligned_erms  can hit the error.
+          */
+         alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
+#ifdef _WIN32
+         /* the Windows driver exports OPAQUE_WIN32; the guest sees OPAQUE_FD */
+         if (physical_dev->host_external_memory_win32)
+            handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#endif
+      }
+
+      local_info->export = (VkExportMemoryAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .pNext = alloc_info->pNext,
+         .handleTypes = handle_type,
+      };
+      alloc_info->pNext = &local_info->export;
+      local_info->valid_fd_types = 1 << fd_type;
+      return VK_SUCCESS;
+   }
+
+   return VK_SUCCESS;
 }
 
 static void
@@ -394,61 +707,46 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
-   VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
-#ifdef _WIN32
-   VkImportMemoryWin32HandleInfoKHR local_import_win32_info = {
-      .handle = INVALID_HANDLE_VALUE,
-   };
-#endif
-   const void *import_info = NULL;
-   VkImportMemoryResourceInfoMESA *res_info = NULL;
-   void *prev_of_res_info = vkr_find_prev_struct(
-      alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
-   if (prev_of_res_info) {
-      res_info = (VkImportMemoryResourceInfoMESA *)vkr_pnext_get_next(prev_of_res_info);
-      if (!vkr_get_fd_info_from_resource_info(ctx, dev, res_info, &local_import_info,
-#ifdef _WIN32
-                                              &local_import_win32_info,
-#endif
-                                              &import_info)) {
-         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-         return;
-      }
-
-      vkr_pnext_set_next(prev_of_res_info, import_info);
-   }
-
-   VkExportMemoryAllocateInfo *export_info =
-      vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
-
-   /* track if driver has requested export allocation */
-   const bool might_export = export_info && export_info->handleTypes;
-
-   /* XXX Force dma_buf/opaque fd export or gbm bo import until a new extension that
-    * supports direct export from host visible memory
-    *
-    * Most VkImage and VkBuffer are non-external while most VkDeviceMemory are external
-    * if allocated with a host visible memory type. We still violate the spec by binding
-    * external memory to non-external image or buffer, which needs spec changes with a
-    * new extension.
-    *
-    * Skip forcing external if a valid VkImportMemoryResourceInfoMESA is provided, since
-    * the mapping will be directly set up from the existing virgl resource.
-    */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
    if (physical_dev->mem_type_spoof && mem_type_index > 0)
       alloc_info->memoryTypeIndex = mem_type_index - 1;
 
-   uint32_t valid_fd_types = 0;
-   VkExternalMemoryHandleTypeFlags guest_export_handle_types = 0;
-   int udmabuf_fd = -1;
-   void *gbm_bo = NULL;
-   struct vkr_shm *shm = NULL;
-   VkExportMemoryAllocateInfo local_export_info;
-   VkImportMemoryHostPointerInfoEXT local_host_import;
+   struct vkr_blob_mem_info blob_info = {
+      .fd = { .fd = -1 },
+      .udmabuf_fd = -1,
+   };
+   void *prev_of_res_info = vkr_find_prev_struct(
+      alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+   if (prev_of_res_info) {
+      /* translate VkImportMemoryResourceInfoMESA into import info in place */
+      if (!vkr_fix_import_info(ctx, physical_dev, alloc_info, prev_of_res_info,
+                               &blob_info)) {
+         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         return;
+      }
+   }
 
+   const bool is_import = prev_of_res_info != NULL;
+   bool might_export_to_share = false;
+   void *prev_of_export_info =
+      vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+   if (prev_of_export_info) {
+      const VkExportMemoryAllocateInfo *export_info =
+         vkr_pnext_get_next(prev_of_export_info);
+      might_export_to_share = !is_import && export_info->handleTypes;
+
+      /* translate driver export info into renderer export info in place */
+      args->ret =
+         vkr_fix_export_info(dev, alloc_info, is_import, prev_of_export_info, &blob_info);
+      if (args->ret != VK_SUCCESS)
+         return;
+   }
+
+   /* Skip forcing external if a valid VkImportMemoryResourceInfoMESA is provided, since
+    * the mapping will be directly set up from the existing virgl resource, or if
+    * might_export_to_share has already configured external backing above.
+    */
 #ifdef _WIN32
    /* Windows: the guest may create a blob from any allocation, also from
     * device-local memory that is not host visible (vkcube's Wayland
@@ -456,178 +754,26 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * through gbm/udmabuf import; Windows has neither, so every allocation is
     * made exportable as OPAQUE_WIN32 when the host driver supports it.
     */
-   const bool force_export_candidate =
-      !res_info && ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
-                    physical_dev->host_external_memory_win32);
+   const bool export_candidate = (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+                                 physical_dev->host_external_memory_win32;
 #else
-   const bool force_export_candidate =
-      (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info;
+   const bool export_candidate = property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 #endif
-   if (force_export_candidate) {
-      /* An implementation can support dma_buf import along with opaque fd export/import.
-       * If the client driver is using external memory and requesting dma_buf, without
-       * dma_buf fd export support, we must use gbm bo import path instead of forcing
-       * opaque fd export. e.g. the client driver uses external memory for wsi image.
-       */
-      const bool no_dma_buf_export =
-         !export_info ||
-         !(export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
-      const bool force_gbm_import = !!physical_dev->gbm_device;
-      const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
-      if (!(force_gbm_import || force_udmabuf_import) &&
-          (physical_dev->is_dma_buf_fd_export_supported ||
-           (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
-         const VkExternalMemoryHandleTypeFlagBits guest_handle_type =
-            physical_dev->is_dma_buf_fd_export_supported
-               ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
-               : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-         VkExternalMemoryHandleTypeFlagBits host_handle_type = guest_handle_type;
-#ifdef _WIN32
-         if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
-             physical_dev->host_external_memory_win32) {
-            host_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-         }
-#endif
-         guest_export_handle_types = guest_handle_type;
-         if (export_info) {
-            export_info->handleTypes = host_handle_type;
-         } else {
-            local_export_info = (const VkExportMemoryAllocateInfo){
-               .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-               .pNext = alloc_info->pNext,
-               .handleTypes = host_handle_type,
-            };
-            export_info = &local_export_info;
-            alloc_info->pNext = &local_export_info;
-
-            if (guest_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
-               /* Guest virtgpu kernel aligns up blob mem size to the page boundary. No
-                * matter dma-buf or opaque fd export allocation, the actual allocation
-                * in most cases would follow the same padding. For dma-buf, we are able
-                * to allocate and validate via lseek below. For opaque fd, Vulkan spec
-                * requires to use the same size with allocation time for the mapper,
-                * either vkr_allocator or vulkano, to import and populate the mapping.
-                * Accessible mapping given by vkMapMemory is normally limited to just the
-                * alloc size. When KVM register the mappings to guest pci bar, that
-                * involves an invalid chunk towards the end of the page boundary. As a
-                * result, any guest side accelerated instructions that rely on the
-                * paddings can end up with Illegal instruction error. The most common
-                * trigger is via memcpy'ing valid range to the guest side mapped buffer
-                * memory, and then, e.g. __memcpy_avx_unaligned_erms  can hit the error.
-                */
-               alloc_info->allocationSize =
-                  align(alloc_info->allocationSize, getpagesize());
-            }
-         }
-      } else if (physical_dev->use_host_memory_import) {
-         /* Allocate shm and import it as host memory. */
-         shm = vkr_shm_alloc(alloc_info->allocationSize,
-                             physical_dev->min_imported_host_pointer_alignment);
-         if (!shm) {
-            args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
-            return;
-         }
-
-         VkMemoryHostPointerPropertiesEXT host_props = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
-         };
-         args->ret = dev->GetMemoryHostPointerPropertiesEXT(
-            dev->base.handle.device,
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, shm->ptr,
-            &host_props);
-         /* alloc_info->memoryTypeIndex is the driver's index, which the memory
-          * type spoof may have shifted from the one the guest asked for
-          */
-         if (args->ret == VK_SUCCESS &&
-             !(host_props.memoryTypeBits & (1u << alloc_info->memoryTypeIndex))) {
-            vkr_log("host memory import is unsupported for memory type %u",
-                    alloc_info->memoryTypeIndex);
-            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-         }
-         if (args->ret != VK_SUCCESS) {
-            vkr_shm_free(shm);
-            return;
-         }
-
-         local_host_import = (VkImportMemoryHostPointerInfoEXT){
-            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
-            .pNext = alloc_info->pNext,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-            .pHostPointer = shm->ptr,
-         };
-         alloc_info->pNext = &local_host_import;
-         alloc_info->allocationSize = shm->size;
-         valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
-      } else if (physical_dev->EXT_external_memory_dma_buf
-#ifdef _WIN32
-                 /* Windows has no gbm/udmabuf ("minigbm_allocation is not
-                  * enabled", vkAllocateMemory -2 for Wayland swapchain
-                  * images); the dma-buf shim below exports the guest's
-                  * DMA_BUF request as OPAQUE_WIN32 instead.
-                  */
-                 && !(export_info && physical_dev->dma_buf_shim_active)
-#endif
-      ) {
-         /* Allocate dma_buf externally and force to import. */
-         if (export_info) {
-            /* Strip export info since valid_fd_types can only be dma_buf here. */
-            void *prev_of_export_info = vkr_find_prev_struct(
-               alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
-
-            vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
-            export_info = NULL;
-         }
-
-         if (force_udmabuf_import) {
-            /* To be noted, there are 2 limits for udmabuf:
-             * - list_limit: udmabuf_create_list->count limit. Default is 1024.
-             * - size_limit_mb: Max size of a dmabuf, in megabytes. Default is 64.
-             */
-            args->ret = vkr_udmabuf_get_fd_info_from_allocation_info(
-               physical_dev, alloc_info, &udmabuf_fd, &local_import_info);
-         } else {
-            args->ret = vkr_gbm_get_fd_info_from_allocation_info(
-               physical_dev, alloc_info, &gbm_bo, &local_import_info);
-         }
-         if (args->ret != VK_SUCCESS)
-            return;
-
-         alloc_info->pNext = &local_import_info;
-         valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
-      }
+   const bool might_export_to_map = !is_import && !might_export_to_share && export_candidate;
+   if (might_export_to_map) {
+      args->ret = vkr_fix_mappable_info(dev, alloc_info, &blob_info);
+      if (args->ret != VK_SUCCESS)
+         return;
    }
-
-   if (!guest_export_handle_types && export_info)
-      guest_export_handle_types = export_info->handleTypes;
-
-   if (export_info) {
-      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
-         valid_fd_types |= 1 << VIRGL_RESOURCE_FD_OPAQUE;
-      if (guest_export_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
-         valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
-   }
-
-#ifdef _WIN32
-   /*
-    * dma-buf shim: host ICD does not understand DMA_BUF_BIT_EXT. Remap any
-    * DMA_BUF entry in the export info to OPAQUE_WIN32 before calling the
-    * host. guest_export_handle_types was captured above and retains the
-    * DMA_BUF bit, so valid_fd_types correctly reports DMA_BUF back to the
-    * guest. OPAQUE_FD is similarly remapped to OPAQUE_WIN32 for consistency.
-    */
-   if (export_info && physical_dev->dma_buf_shim_active) {
-      const VkExternalMemoryHandleTypeFlags fd_bits =
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-      if (export_info->handleTypes & fd_bits) {
-         export_info->handleTypes =
-            (export_info->handleTypes & ~fd_bits) |
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-      }
-   }
-#endif
 
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+#ifdef _WIN32
+   /* Importing a Win32 handle does not take it over (unlike an fd): close our
+    * duplicate whether the import worked or not.
+    */
+   if (blob_info.win32.handle && blob_info.win32.handle != INVALID_HANDLE_VALUE)
+      CloseHandle(blob_info.win32.handle);
+#endif
    if (!mem) {
       {
          /* Which allocation the host driver refused: the guest only sees
@@ -642,40 +788,35 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          vkr_log("vkAllocateMemory failed (%d): size %llu type %u props 0x%x export 0x%x "
                  "import %d dedicated %s flags 0x%x",
                  args->ret, (unsigned long long)alloc_info->allocationSize, mem_type_index,
-                 property_flags, e ? e->handleTypes : 0, import_info != NULL,
+                 property_flags, e ? e->handleTypes : 0, is_import,
                  d ? (d->image ? "image" : d->buffer ? "buffer" : "none") : "no",
                  f ? f->flags : 0);
       }
-      if (local_import_info.fd >= 0)
-         os_close_fd(local_import_info.fd);
-#ifdef _WIN32
-      if (local_import_win32_info.handle &&
-          local_import_win32_info.handle != INVALID_HANDLE_VALUE)
-         CloseHandle(local_import_win32_info.handle);
-#endif
-      if (gbm_bo)
-         vkr_gbm_bo_destroy(gbm_bo);
-      vkr_shm_free(shm);
+      if (blob_info.fd.fd >= 0)
+         os_close_fd(blob_info.fd.fd);
+      if (blob_info.gbm_bo)
+         vkr_gbm_bo_destroy(blob_info.gbm_bo);
+      if (blob_info.udmabuf_fd >= 0)
+         os_close_fd(blob_info.udmabuf_fd);
+      vkr_shm_destroy(blob_info.shm);
       return;
    }
 
    mem->device = dev;
-   mem->might_export = might_export;
+   mem->might_export_to_share = might_export_to_share;
    mem->property_flags = property_flags;
-   mem->valid_fd_types = valid_fd_types;
-   mem->udmabuf_fd = udmabuf_fd;
-   mem->gbm_bo = gbm_bo;
-   mem->shm = shm;
+   mem->valid_fd_types = blob_info.valid_fd_types;
+   mem->udmabuf_fd = blob_info.udmabuf_fd;
+   mem->gbm_bo = blob_info.gbm_bo;
+   mem->shm = blob_info.shm;
    mem->allocation_size = alloc_info->allocationSize;
    /* the driver's index (the memory type spoof may have shifted it from the
     * guest's): importers of this memory allocate on the host driver
     */
    mem->memory_type_index = alloc_info->memoryTypeIndex;
-   {
-      const VkMemoryDedicatedAllocateInfo *ded =
-         vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
-      mem->dedicated = ded && ded->image != VK_NULL_HANDLE;
-   }
+   const VkMemoryDedicatedAllocateInfo *dedicated =
+      vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+   mem->dedicated = dedicated && dedicated->image != VK_NULL_HANDLE;
 }
 
 static void
@@ -738,50 +879,88 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       return;
    }
 
-   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
-   /* Windows hosts have no vkGetMemoryFdPropertiesKHR (it was called through
-    * NULL and QEMU crashed: Windows guests import their dma-buf shared
-    * surfaces, 2026-11-15); their dma-bufs are OPAQUE_WIN32 underneath (the
-    * dma-buf shim), so they take the Win32 path below.
-    */
-   if (res->fd_type == VIRGL_RESOURCE_FD_DMABUF && vk->GetMemoryFdPropertiesKHR) {
-      static const VkExternalMemoryHandleTypeFlagBits handle_type =
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      VkMemoryFdPropertiesKHR mem_fd_props = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
-         .pNext = NULL,
-         .memoryTypeBits = 0,
-      };
-      args->ret =
-         vk->GetMemoryFdPropertiesKHR(args->device, handle_type, res->u.fd, &mem_fd_props);
-      if (args->ret != VK_SUCCESS)
-         return;
-
-      vkr_physical_device_mem_type_spoof(dev->physical_device, &mem_fd_props.memoryTypeBits);
-      args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
-#ifdef _WIN32
-   } else if ((res->fd_type == VIRGL_RESOURCE_FD_OPAQUE ||
-               res->fd_type == VIRGL_RESOURCE_FD_DMABUF) &&
-              dev->GetMemoryWin32HandlePropertiesKHR) {
-      HANDLE handle = os_get_win32_handle_from_fd(res->u.fd);
-      VkMemoryWin32HandlePropertiesKHR props = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
-         .pNext = NULL,
-         .memoryTypeBits = 0,
-      };
-      args->ret = dev->GetMemoryWin32HandlePropertiesKHR(
-         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT, handle, &props);
-      if (args->ret != VK_SUCCESS)
-         return;
-
-      vkr_physical_device_mem_type_spoof(dev->physical_device, &props.memoryTypeBits);
-      args->pMemoryResourceProperties->memoryTypeBits = props.memoryTypeBits;
-#endif
-   } else {
+   if (!res->fd_valid) {
       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return;
    }
 
+   vn_replace_vkGetMemoryResourcePropertiesMESA_args_handle(args);
+
+#ifdef _WIN32
+   /* Windows hosts have no vkGetMemoryFdPropertiesKHR (it was called through
+    * NULL and QEMU crashed: Windows guests import their dma-buf shared
+    * surfaces, 2026-11-15); their dma-bufs (the dma-buf shim) and opaque fds
+    * are OPAQUE_WIN32 handles underneath.
+    */
+   if ((res->fd_type == VIRGL_RESOURCE_FD_DMABUF ||
+        res->fd_type == VIRGL_RESOURCE_FD_OPAQUE) &&
+       !vk->GetMemoryFdPropertiesKHR) {
+      if (!dev->GetMemoryWin32HandlePropertiesKHR) {
+         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         return;
+      }
+
+      VkMemoryWin32HandlePropertiesKHR props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+      };
+      args->ret = dev->GetMemoryWin32HandlePropertiesKHR(
+         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+         os_get_win32_handle_from_fd(res->u.fd), &props);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      args->pMemoryResourceProperties->memoryTypeBits = props.memoryTypeBits;
+   } else
+#endif
+   switch (res->fd_type) {
+   case VIRGL_RESOURCE_FD_DMABUF: {
+      VkMemoryFdPropertiesKHR mem_fd_props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
+      };
+      args->ret = vk->GetMemoryFdPropertiesKHR(
+         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, res->u.fd,
+         &mem_fd_props);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      args->pMemoryResourceProperties->memoryTypeBits = mem_fd_props.memoryTypeBits;
+      break;
+   }
+   case VIRGL_RESOURCE_FD_SHM: {
+      const struct vkr_physical_device *physical_dev = dev->physical_device;
+      if (!physical_dev->EXT_external_memory_host) {
+         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         return;
+      }
+
+      const VkDeviceSize host_ptr_alignment =
+         physical_dev->host_ptr_props.minImportedHostPointerAlignment;
+      struct vkr_shm *shm = vkr_shm_create(res->u.fd, res->size, host_ptr_alignment);
+      if (!shm) {
+         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         return;
+      }
+
+      VkMemoryHostPointerPropertiesEXT host_props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+      };
+      args->ret = dev->GetMemoryHostPointerPropertiesEXT(
+         args->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, shm->ptr,
+         &host_props);
+      vkr_shm_destroy(shm);
+      if (args->ret != VK_SUCCESS)
+         return;
+
+      args->pMemoryResourceProperties->memoryTypeBits = host_props.memoryTypeBits;
+      break;
+   }
+   default:
+      args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      return;
+   }
+
+   vkr_physical_device_mem_type_spoof(dev->physical_device,
+                                      &args->pMemoryResourceProperties->memoryTypeBits);
 
    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
       vkr_find_struct(args->pMemoryResourceProperties->pNext,
@@ -813,7 +992,7 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
-   vkr_shm_free(mem->shm);
+   vkr_shm_destroy(mem->shm);
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
@@ -851,7 +1030,13 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                       : VIRGL_RENDERER_MAP_CACHE_WC;
    }
 
-   if (mem->shm) {
+   if (mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_SHM)) {
+      assert(mem->shm);
+      if (blob_size > mem->shm->size) {
+         vkr_log("mem shm_size %zu < blob_size %" PRIu64, mem->shm->size, blob_size);
+         return false;
+      }
+
       mem->exported = true;
       *out_blob = (struct virgl_context_blob){
          .type = VIRGL_RESOURCE_FD_SHM,
@@ -975,23 +1160,23 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       }
    }
 
-   if (fd_type == VIRGL_RESOURCE_FD_DMABUF) {
 #ifndef _WIN32
-      /* Real Linux dma-buf fds are seekable and lseek returns the size. On
-       * Windows, the "fd" is a token wrapping an NT HANDLE that isn't a
-       * real file descriptor; skip the size validation, we trust the size
-       * that was passed to vkAllocateMemory. */
+   /* Real dma-buf fds are seekable and lseek returns the size. On Windows the
+    * "fd" wraps an NT HANDLE, so the size given to vkAllocateMemory is trusted.
+    */
+   if (fd_type == VIRGL_RESOURCE_FD_DMABUF) {
       const off_t dma_buf_size = lseek(fd, 0, SEEK_END);
       if (dma_buf_size < 0 || (uint64_t)dma_buf_size < blob_size) {
          vkr_log("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
                  blob_size);
-         os_close_fd(fd);
+         close(fd);
          return false;
       }
-#endif
    }
+#endif
 
    mem->exported = true;
+
    *out_blob = (struct virgl_context_blob){
       .type = fd_type,
       .u.fd = fd,
