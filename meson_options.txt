@@ -53,6 +53,15 @@ option(
 )
 
 option(
+  'venus-spirv-validate',
+  type : 'feature',
+  value : 'auto',
+  description : 'validate guest SPIR-V with SPIRV-Tools before the host driver ' +
+                'compiles it, so an invalid shader fails one guest context ' +
+                'instead of crashing the host driver (and the VMM with it)'
+)
+
+option(
   'vulkan-dload',
   type : 'boolean',
   value : true,

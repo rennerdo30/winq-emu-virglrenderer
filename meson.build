@@ -385,6 +385,11 @@ if with_venus
    )
 
    venus_dep = [dep_venus_protocol]
+   spirv_tools_dep = dependency('SPIRV-Tools-shared', required : get_option('venus-spirv-validate'))
+   if spirv_tools_dep.found()
+      conf_data.set('ENABLE_VENUS_SPIRV_VALIDATE', 1)
+      venus_dep += spirv_tools_dep
+   endif
    if get_option('vulkan-dload')
       conf_data.set('ENABLE_VULKAN_DLOAD', 1)
    else

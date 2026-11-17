@@ -6,6 +6,105 @@
 #include "vkr_pipeline.h"
 
 #include "vkr_pipeline_gen.h"
+#include "vkr_spirv.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Shader code given inline to a pipeline stage (maintenance5) instead of a module. */
+static bool
+vkr_pipeline_stages_check(const struct vkr_context *ctx,
+                          const VkPipelineShaderStageCreateInfo *stages,
+                          uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      for (const VkBaseInStructure *p = stages[i].pNext; p; p = p->pNext) {
+         if (p->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+            continue;
+         const VkShaderModuleCreateInfo *smci = (const VkShaderModuleCreateInfo *)p;
+         if (!vkr_spirv_check(ctx->ctx_id, smci->pCode, smci->codeSize))
+            return false;
+      }
+   }
+   return true;
+}
+
+/*
+ * Debugging aid: with VKR_SHADER_DUMP=<dir>, every shader module is written
+ * to <dir>/<ctx>-<module>.spv and every compute pipeline is logged (to stderr)
+ * before the driver sees it, so the last log line before a driver crash names
+ * the shader that caused it.
+ */
+static once_flag vkr_shader_dump_once = ONCE_FLAG_INIT;
+static const char *vkr_shader_dump_path;
+
+static void
+vkr_shader_dump_init_once(void)
+{
+   const char *d = getenv("VKR_SHADER_DUMP");
+   vkr_shader_dump_path = d && *d ? d : NULL;
+}
+
+static const char *
+vkr_shader_dump_dir(void)
+{
+   call_once(&vkr_shader_dump_once, vkr_shader_dump_init_once);
+   return vkr_shader_dump_path;
+}
+
+static void
+vkr_shader_dump_code(const struct vkr_context *ctx,
+                     const char *name,
+                     const uint32_t *code,
+                     size_t size)
+{
+   char path[1024];
+   FILE *f;
+
+   snprintf(path, sizeof(path), "%s/%u-%s.spv", vkr_shader_dump_dir(), ctx->ctx_id, name);
+   f = fopen(path, "wb");
+   if (!f)
+      return;
+   fwrite(code, 1, size, f);
+   fclose(f);
+}
+
+static void
+vkr_shader_dump_compute(const struct vkr_context *ctx,
+                        const struct vn_command_vkCreateComputePipelines *args)
+{
+   for (uint32_t i = 0; i < args->createInfoCount; i++) {
+      const VkComputePipelineCreateInfo *ci = &args->pCreateInfos[i];
+      const VkPipelineShaderStageCreateInfo *st = &ci->stage;
+      /* Decoded handles still point at vkr objects; these are the driver's. */
+      uint64_t module = st->module ? vn_cs_get_object_handle((const void **)&st->module,
+                                                              VK_OBJECT_TYPE_SHADER_MODULE)
+                                   : 0;
+      uint64_t layout =
+         vn_cs_get_object_handle((const void **)&ci->layout, VK_OBJECT_TYPE_PIPELINE_LAYOUT);
+      uint64_t cache = args->pipelineCache
+                          ? vn_cs_get_object_handle((const void **)&args->pipelineCache,
+                                                    VK_OBJECT_TYPE_PIPELINE_CACHE)
+                          : 0;
+      char chain[256] = "";
+      size_t used = 0;
+
+      for (const VkBaseInStructure *p = st->pNext; p && used < sizeof(chain) - 16; p = p->pNext) {
+         used += snprintf(chain + used, sizeof(chain) - used, " %u", p->sType);
+         if (p->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+            const VkShaderModuleCreateInfo *smci = (const VkShaderModuleCreateInfo *)p;
+            char name[64];
+            snprintf(name, sizeof(name), "inline-%" PRIu64, layout);
+            vkr_shader_dump_code(ctx, name, smci->pCode, smci->codeSize);
+         }
+      }
+      vkr_log("dump: ctx %u compute pipeline %u/%u: module %" PRIu64 " entry %s layout %" PRIu64
+              " cache %" PRIu64 " flags 0x%x stage flags 0x%x spec %u stage pNext:%s",
+              ctx->ctx_id, i + 1, args->createInfoCount, module,
+              st->pName ? st->pName : "(null)", layout, cache, ci->flags, st->flags,
+              st->pSpecializationInfo ? st->pSpecializationInfo->mapEntryCount : 0, chain);
+   }
+}
 
 static void
 vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
@@ -41,7 +140,20 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   vkr_shader_module_create_and_add(dispatch->data, args);
+   /* An invalid module is not created; a later use of it fails this context. */
+   if (!vkr_spirv_check(ctx->ctx_id, args->pCreateInfo->pCode, args->pCreateInfo->codeSize)) {
+      args->ret = VK_ERROR_INVALID_SHADER_NV;
+      return;
+   }
+
+   struct vkr_shader_module *mod = vkr_shader_module_create_and_add(dispatch->data, args);
+
+   if (vkr_shader_dump_dir() && mod) {
+      char name[32];
+      /* The driver handle: pipeline create infos carry it after decoding. */
+      snprintf(name, sizeof(name), "%" PRIu64, mod->base.handle.u64);
+      vkr_shader_dump_code(ctx, name, args->pCreateInfo->pCode, args->pCreateInfo->codeSize);
+   }
 }
 
 static void
@@ -114,6 +226,15 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
 
+   for (uint32_t i = 0; i < args->createInfoCount; i++) {
+      const VkGraphicsPipelineCreateInfo *ci = &args->pCreateInfos[i];
+      if (!vkr_pipeline_stages_check(ctx, ci->pStages, ci->stageCount)) {
+         args->ret = VK_ERROR_INVALID_SHADER_NV;
+         memset(args->pPipelines, 0, args->createInfoCount * sizeof(args->pPipelines[0]));
+         return;
+      }
+   }
+
    if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
       return;
 
@@ -128,6 +249,17 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+
+   if (vkr_shader_dump_dir())
+      vkr_shader_dump_compute(ctx, args);
+
+   for (uint32_t i = 0; i < args->createInfoCount; i++) {
+      if (!vkr_pipeline_stages_check(ctx, &args->pCreateInfos[i].stage, 1)) {
+         args->ret = VK_ERROR_INVALID_SHADER_NV;
+         memset(args->pPipelines, 0, args->createInfoCount * sizeof(args->pPipelines[0]));
+         return;
+      }
+   }
 
    if (vkr_compute_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
       return;
@@ -151,6 +283,15 @@ vkr_dispatch_vkCreateRayTracingPipelinesKHR(
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+
+   for (uint32_t i = 0; i < args->createInfoCount; i++) {
+      const VkRayTracingPipelineCreateInfoKHR *ci = &args->pCreateInfos[i];
+      if (!vkr_pipeline_stages_check(ctx, ci->pStages, ci->stageCount)) {
+         args->ret = VK_ERROR_INVALID_SHADER_NV;
+         memset(args->pPipelines, 0, args->createInfoCount * sizeof(args->pPipelines[0]));
+         return;
+      }
+   }
 
    if (vkr_ray_tracing_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
       return;

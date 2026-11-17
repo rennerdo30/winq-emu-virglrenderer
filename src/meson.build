@@ -92,6 +92,7 @@ venus_sources = [
    'venus/vkr_render_pass.c',
    'venus/vkr_renderer.c',
    'venus/vkr_ring.c',
+   'venus/vkr_spirv.c',
    'venus/vkr_transport.c',
    'venus/vkr_win32_shim.c',
 ]
