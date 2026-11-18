@@ -88,7 +88,10 @@ struct server_context_worker {
    uint32_t ctx_id;
    char name[32];
    uint32_t name_len;
-   int socket_fd;
+   /* Closed by whichever of the worker and server_destroy_worker comes first,
+    * see server_worker_close_socket.
+    */
+   atomic_int socket_fd;
 
    /* shared memory for timeline seqnos (mapped by proxy_context) */
    void *shmem_ptr;
@@ -272,6 +275,19 @@ server_ensure_vkr_init(struct server_thread_state *state)
    }
    mtx_unlock(&state->renderer_mutex);
    return true;
+}
+
+/* The worker closes its socket when it exits, and server_destroy_worker closes
+ * it to wake the worker's recv. Only the first close may reach closesocket:
+ * Windows reuses a closed handle value at once, so a second close can end an
+ * unrelated socket, such as another context's.
+ */
+static void
+server_worker_close_socket(struct server_context_worker *w)
+{
+   const int fd = atomic_exchange(&w->socket_fd, -1);
+   if (fd >= 0)
+      closesocket((SOCKET)fd);
 }
 
 /*
@@ -514,7 +530,7 @@ done:
    if (w->shmem_ptr)
       UnmapViewOfFile(w->shmem_ptr);
 
-   closesocket((SOCKET)w->socket_fd);
+   server_worker_close_socket(w);
    return 0;
 }
 
@@ -523,7 +539,7 @@ server_destroy_worker(struct server_thread_state *state,
                       struct server_context_worker *w)
 {
    /* Close our end; worker thread will exit when recv fails */
-   closesocket((SOCKET)w->socket_fd);
+   server_worker_close_socket(w);
    thrd_join(w->thread, NULL);
 
    list_del(&w->head);
