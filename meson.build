@@ -508,7 +508,7 @@ if with_unstable_apis
 endif
 
 subdir('src')
-if with_vrend and not with_host_windows
+if not with_host_windows
    subdir('vtest')
 endif
 
