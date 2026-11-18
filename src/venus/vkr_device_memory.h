@@ -33,6 +33,9 @@ struct vkr_device_memory {
    uint64_t allocation_size;
    uint32_t memory_type_index;
    bool dedicated;
+   /* Windows: the dedicated image as the driver created it, for exports */
+   bool has_image_info;
+   struct virgl_resource_image_info image_info;
 
    bool exported;
 };

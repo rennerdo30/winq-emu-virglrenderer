@@ -1608,6 +1608,24 @@ virgl_renderer_resource_export_win32(uint32_t res_id,
                                                            : res->map_size;
    out->memory_type_index = res->vulkan_info.memory_type_index;
    out->flags = res->vulkan_info.dedicated ? VIRGL_RENDERER_WIN32_HANDLE_DEDICATED : 0;
+   if (res->vulkan_info.has_image) {
+      const struct virgl_resource_image_info *im = &res->vulkan_info.image;
+
+      out->flags |= VIRGL_RENDERER_WIN32_HANDLE_IMAGE;
+      out->image_flags = im->flags;
+      out->image_type = im->image_type;
+      out->image_format = im->format;
+      out->image_width = im->width;
+      out->image_height = im->height;
+      out->image_depth = im->depth;
+      out->image_mip_levels = im->mip_levels;
+      out->image_array_layers = im->array_layers;
+      out->image_samples = im->samples;
+      out->image_tiling = im->tiling;
+      out->image_usage = im->usage;
+      out->image_sharing_mode = im->sharing_mode;
+      out->image_handle_types = im->handle_types;
+   }
    memcpy(out->device_uuid, res->vulkan_info.device_uuid, sizeof(out->device_uuid));
    memcpy(out->driver_uuid, res->vulkan_info.driver_uuid, sizeof(out->driver_uuid));
    return 0;

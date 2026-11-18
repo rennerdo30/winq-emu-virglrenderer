@@ -53,12 +53,34 @@ enum virgl_resource_fd_type {
    VIRGL_RESOURCE_FD_INVALID = -1,
 };
 
+/*
+ * The image a dedicated allocation belongs to, exactly as the host driver
+ * created it (Vk* enum and flag values). Importers recreate that image to read
+ * the memory: the driver may compress image memory, which only an identical
+ * image reads back correctly.
+ */
+struct virgl_resource_image_info {
+   uint32_t flags;          /* VkImageCreateFlags */
+   uint32_t image_type;     /* VkImageType */
+   uint32_t format;         /* VkFormat */
+   uint32_t width, height, depth;
+   uint32_t mip_levels;
+   uint32_t array_layers;
+   uint32_t samples;        /* VkSampleCountFlagBits */
+   uint32_t tiling;         /* VkImageTiling */
+   uint32_t usage;          /* VkImageUsageFlags */
+   uint32_t sharing_mode;   /* VkSharingMode */
+   uint32_t handle_types;   /* VkExternalMemoryImageCreateInfo::handleTypes */
+};
+
 struct virgl_resource_vulkan_info {
    uint8_t device_uuid[16];
    uint8_t driver_uuid[16];
    uint64_t allocation_size;
    uint32_t memory_type_index;
    bool dedicated; /* VkMemoryDedicatedAllocateInfo with an image */
+   bool has_image; /* image: the dedicated image (Windows) */
+   struct virgl_resource_image_info image;
 };
 
 /**

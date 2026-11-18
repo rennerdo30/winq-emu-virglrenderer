@@ -18,6 +18,10 @@
 
 #ifdef _WIN32
 
+#include <stdbool.h>
+
+#include <vulkan/vulkan.h>
+
 struct vkr_device;
 
 /*
@@ -55,6 +59,16 @@ vkr_win32_device_remove_shim(struct vkr_device *dev);
  */
 void
 vkr_win32_flush_deferred_destroys(struct vkr_device *dev);
+
+struct virgl_resource_image_info;
+
+/*
+ * How the driver created @image (a driver handle), if it was created through
+ * the shim recently (the last 256 images are kept).
+ */
+bool
+vkr_win32_shim_image_info(struct vkr_device *dev, VkImage image,
+                          struct virgl_resource_image_info *out);
 
 #endif /* _WIN32 */
 

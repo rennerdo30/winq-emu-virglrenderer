@@ -23,6 +23,9 @@
 
 #include "vkr_device_memory_gen.h"
 #include "vkr_physical_device.h"
+#ifdef _WIN32
+#include "vkr_win32_shim.h"
+#endif
 
 #if defined(HAVE_LINUX_UDMABUF_H) && defined(HAVE_MEMFD_CREATE)
 #include <fcntl.h>
@@ -817,6 +820,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    const VkMemoryDedicatedAllocateInfo *dedicated =
       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
    mem->dedicated = dedicated && dedicated->image != VK_NULL_HANDLE;
+#ifdef _WIN32
+   /* the handles in alloc_info were replaced by the driver's at creation */
+   if (mem->dedicated)
+      mem->has_image_info = vkr_win32_shim_image_info(dev, dedicated->image, &mem->image_info);
+#endif
 }
 
 static void
@@ -1056,6 +1064,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       .allocation_size = mem->allocation_size,
       .memory_type_index = mem->memory_type_index,
       .dedicated = mem->dedicated,
+      .has_image = mem->has_image_info,
+      .image = mem->image_info,
    };
    memcpy(vulkan_info.device_uuid, mem->device->physical_device->id_properties.deviceUUID,
           VK_UUID_SIZE);
@@ -1094,6 +1104,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       vulkan_info.allocation_size = mem->allocation_size;
       vulkan_info.memory_type_index = mem->memory_type_index;
       vulkan_info.dedicated = mem->dedicated;
+      vulkan_info.has_image = mem->has_image_info;
+      vulkan_info.image = mem->image_info;
    } else {
       vkr_log("mem is not exportable");
       return false;

@@ -13,6 +13,7 @@
 
 #include "util/os_file.h"
 
+#include "virgl_resource.h"
 #include "vkr_device.h"
 #include "vkr_physical_device.h"
 
@@ -40,6 +41,19 @@ struct vkr_win32_device_entry {
     * that need to call through to the real driver.
     */
    struct vn_device_proc_table saved_proc_table;
+
+   /*
+    * Images as the driver created them (newest last), for exports of
+    * dedicated image memory: the allocation follows the image's creation, so
+    * the last few are enough. Guests do not always chain
+    * VkExternalMemoryImageCreateInfo, so every image is kept.
+    */
+   SRWLOCK images_lock;
+   struct {
+      VkImage image;
+      struct virgl_resource_image_info info;
+   } images[256];
+   unsigned image_next;
 };
 
 static struct vkr_win32_device_entry **vkr_win32_devices;
@@ -301,7 +315,51 @@ vkr_win32_CreateImage(VkDevice device,
       info_in = &info_local;
    }
 
-   return entry->saved_proc_table.CreateImage(device, info_in, pAllocator, pImage);
+   VkResult res = entry->saved_proc_table.CreateImage(device, info_in, pAllocator, pImage);
+   if (res == VK_SUCCESS) {
+      AcquireSRWLockExclusive(&entry->images_lock);
+      unsigned i = entry->image_next++ % ARRAY_SIZE(entry->images);
+      entry->images[i].image = *pImage;
+      entry->images[i].info = (struct virgl_resource_image_info){
+         .flags = info_in->flags,
+         .image_type = info_in->imageType,
+         .format = info_in->format,
+         .width = info_in->extent.width,
+         .height = info_in->extent.height,
+         .depth = info_in->extent.depth,
+         .mip_levels = info_in->mipLevels,
+         .array_layers = info_in->arrayLayers,
+         .samples = info_in->samples,
+         .tiling = info_in->tiling,
+         .usage = info_in->usage,
+         .sharing_mode = info_in->sharingMode,
+         .handle_types = ext_info ? ext_info->handleTypes : 0,
+      };
+      ReleaseSRWLockExclusive(&entry->images_lock);
+   }
+   return res;
+}
+
+bool
+vkr_win32_shim_image_info(struct vkr_device *dev, VkImage image,
+                          struct virgl_resource_image_info *out)
+{
+   struct vkr_win32_device_entry *entry = vkr_win32_lookup_device(dev->base.handle.device);
+   bool found = false;
+
+   if (!entry || image == VK_NULL_HANDLE)
+      return false;
+   AcquireSRWLockShared(&entry->images_lock);
+   for (unsigned n = 0; n < ARRAY_SIZE(entry->images) && n < entry->image_next; n++) {
+      unsigned i = (entry->image_next - 1 - n) % ARRAY_SIZE(entry->images);
+      if (entry->images[i].image == image) {
+         *out = entry->images[i].info;
+         found = true;
+         break;
+      }
+   }
+   ReleaseSRWLockShared(&entry->images_lock);
+   return found;
 }
 
 /* ------------------------------------------------------------------ */
@@ -598,6 +656,7 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
    }
    entry->handle = dev->base.handle.device;
    entry->dev = dev;
+   InitializeSRWLock(&entry->images_lock);
 
    /* Save the entire proc table so we can restore it on removal */
    entry->saved_proc_table = *vk;

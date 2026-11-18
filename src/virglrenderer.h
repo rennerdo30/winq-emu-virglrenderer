@@ -447,6 +447,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
  * returned handle is a duplicate; the caller closes it with CloseHandle().
  */
 #define VIRGL_RENDERER_WIN32_HANDLE_DEDICATED 0x1 /* dedicated image allocation */
+#define VIRGL_RENDERER_WIN32_HANDLE_IMAGE     0x2 /* the image_* fields are set */
 
 struct virgl_renderer_win32_export {
    void *handle;                 /* VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT */
@@ -455,6 +456,16 @@ struct virgl_renderer_win32_export {
    uint32_t flags;               /* VIRGL_RENDERER_WIN32_HANDLE_* */
    uint8_t device_uuid[16];      /* VkPhysicalDeviceIDProperties::deviceUUID */
    uint8_t driver_uuid[16];
+   /*
+    * With VIRGL_RENDERER_WIN32_HANDLE_IMAGE: the dedicated image exactly as the
+    * host driver created it (Vk* values). The driver may compress image
+    * memory; recreate this image and import the memory as its dedicated
+    * allocation to read it (a plain buffer reads compressed bytes).
+    */
+   uint32_t image_flags, image_type, image_format;
+   uint32_t image_width, image_height, image_depth;
+   uint32_t image_mip_levels, image_array_layers, image_samples;
+   uint32_t image_tiling, image_usage, image_sharing_mode, image_handle_types;
 };
 
 VIRGL_EXPORT int
